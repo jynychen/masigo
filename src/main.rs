@@ -1,0 +1,154 @@
+mod clip;
+mod gps;
+mod overlay;
+mod process;
+
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use anyhow::Result;
+use clap::Parser;
+
+use clip::Direction;
+
+#[derive(Parser)]
+#[command(name = "dashcam", about = "行車記錄器影片處理工具")]
+struct Cli {
+    /// 輸入目錄（含 *_F.MP4 / *_R.MP4）
+    #[arg(short, long, default_value = "vid_src")]
+    input: PathBuf,
+
+    /// 輸出目錄
+    #[arg(short, long, default_value = "vid_out")]
+    output: PathBuf,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Ctrl-C: 設定旗標，讓目前的 ffmpeg 跑完再結束
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&interrupted);
+    ctrlc::set_handler(move || {
+        flag.store(true, Ordering::SeqCst);
+        eprintln!("\nwait for existing ffmpeg process to finish...");
+    })?;
+
+    std::fs::create_dir_all(&cli.output)?;
+
+    // ── Step 1: 掃描影片，找出連續片段 ──
+    println!("=== Step 1: 掃描影片，建立工作清單 ===\n");
+    let groups = clip::find_groups(&cli.input)?;
+
+    if groups.is_empty() {
+        println!("no valid clip groups found in {}", cli.input.display());
+        return Ok(());
+    }
+
+    for (i, group) in groups.iter().enumerate() {
+        println!("Group {} [{}]", i + 1, group.name);
+        for pair in &group.pairs {
+            println!("{} + {}", pair.front.filename, pair.rear.filename);
+        }
+    }
+
+    print!("\n是否開始處理？(y/n): ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if answer.trim().to_lowercase() != "y" {
+        println!("已取消");
+        return Ok(());
+    }
+
+    // ── Steps 2–6: 逐組處理 ──
+    for (i, group) in groups.iter().enumerate() {
+        println!(
+            "\n{}\nProcessing Group {} [{}]\n{}",
+            "=".repeat(50),
+            i + 1,
+            group.name,
+            "=".repeat(50)
+        );
+
+        // Step 2: concat Front
+        println!("=== Step 2: 串接前鏡頭 ===");
+        let front_file = process::concat_videos(group, &cli.output, Direction::Front)?;
+        println!("F -> {}", front_file.display());
+        if interrupted.load(Ordering::SeqCst) {
+            println!("\nUser interrupted, stopping processing.");
+            return Ok(());
+        }
+
+        // Step 3: concat Rear
+        println!("=== Step 3: 串接後鏡頭 ===");
+        let rear_file = process::concat_videos(group, &cli.output, Direction::Rear)?;
+        println!("R -> {}", rear_file.display());
+        if interrupted.load(Ordering::SeqCst) {
+            println!("\nUser interrupted, stopping processing.");
+            return Ok(());
+        }
+
+        // Step 4: GPS
+        println!("=== Step 4: 解析 GPS ===");
+        let gps_points = match gps::extract_gps_points(&group.front_paths()) {
+            Ok(pts) => {
+                println!("{} GPS points", pts.len());
+                Some(pts)
+            }
+            Err(e) => {
+                println!("GPS parsing failed: {e}");
+                None
+            }
+        };
+
+        // Step 5: GPS overlay
+        let overlay_file = if let Some(ref pts) = gps_points {
+            if interrupted.load(Ordering::SeqCst) {
+                println!("\nUser interrupted, stopping processing.");
+                return Ok(());
+            }
+            println!("=== Step 5: 生成 GPS 軌跡 overlay ===");
+            let (fps, duration) = gps::get_video_info(&front_file)?;
+            println!("影片 {fps:.2} fps, {duration:.1}s");
+            match overlay::render_overlay_video(pts, &cli.output, &group.name, fps, duration) {
+                Ok(path) => {
+                    println!("overlay -> {}", path.display());
+                    Some(path)
+                }
+                Err(e) => {
+                    println!("overlay rendering failed: {e}");
+                    None
+                }
+            }
+        } else {
+            println!("Step 5: (no GPS data, skipping overlay)");
+            None
+        };
+
+        // Step 6: PIP
+        if interrupted.load(Ordering::SeqCst) {
+            println!("\nUser interrupted, stopping processing.");
+            return Ok(());
+        }
+        println!("=== Step 6: PIP 合成 ===");
+        let final_file = process::pip_composite(
+            &front_file,
+            &rear_file,
+            overlay_file.as_deref(),
+            &cli.output,
+            &group.name,
+        )?;
+        println!("-> {}", final_file.display());
+
+        // Clean up intermediate overlay video
+        if let Some(ref ov) = overlay_file {
+            let _ = std::fs::remove_file(ov);
+        }
+    }
+
+    println!("\n=== 全部完成！ ===");
+    Ok(())
+}
