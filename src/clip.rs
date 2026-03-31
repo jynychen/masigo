@@ -21,7 +21,7 @@ pub struct Clip {
     pub path: PathBuf,
 }
 
-/// A pair of F+R clips sharing the same sequence number
+/// Front and rear clip pair with the same sequence number.
 #[derive(Debug, Clone)]
 pub struct ClipPair {
     pub seq: u32,
@@ -29,7 +29,7 @@ pub struct ClipPair {
     pub rear: Clip,
 }
 
-/// A group of consecutive clip pairs
+/// Consecutive clip pairs forming a continuous recording segment.
 #[derive(Debug)]
 pub struct ClipGroup {
     pub pairs: Vec<ClipPair>,
@@ -46,7 +46,7 @@ impl ClipGroup {
     }
 }
 
-pub fn parse_filename(path: &Path) -> Option<Clip> {
+pub fn parse_clip_filename(path: &Path) -> Option<Clip> {
     let filename = path.file_name()?.to_str()?;
     let re = Regex::new(r"^(\d{6})_(\d{6})_(\d{4})_(F|R)\.MP4$").ok()?;
     let caps = re.captures(filename)?;
@@ -65,14 +65,14 @@ pub fn parse_filename(path: &Path) -> Option<Clip> {
     })
 }
 
-/// Scan input directory, pair F+R clips, and group consecutive sequences
-pub fn find_groups(input_dir: &Path) -> Result<Vec<ClipGroup>> {
+/// Scan input directory, pair front/rear clips, and group consecutive sequences.
+pub fn scan_clip_groups(input_dir: &Path) -> Result<Vec<ClipGroup>> {
     let mut clips: Vec<Clip> = Vec::new();
 
     for entry in std::fs::read_dir(input_dir).context("Failed to read input directory")? {
         let entry = entry?;
         let path = entry.path();
-        if let Some(clip) = parse_filename(&path) {
+        if let Some(clip) = parse_clip_filename(&path) {
             clips.push(clip);
         }
     }
@@ -102,16 +102,16 @@ pub fn find_groups(input_dir: &Path) -> Result<Vec<ClipGroup>> {
     // BTreeMap already sorted by key, but sort explicitly for clarity
     pairs.sort_by_key(|p| p.seq);
 
-    // Split into consecutive groups (gap > 60 s → new group)
+    // Split into consecutive groups (gap > 70 s → new group)
     let mut groups: Vec<ClipGroup> = Vec::new();
     let mut current: Vec<ClipPair> = Vec::new();
 
     for pair in pairs {
         if let Some(last) = current.last() {
-            let gap = clip_datetime(&pair.front)
-                .and_then(|t| clip_datetime(&last.front).map(|p| (t - p).num_seconds()));
+            let gap = parse_datetime(&pair.front)
+                .and_then(|t| parse_datetime(&last.front).map(|p| (t - p).num_seconds()));
             if gap.map_or(true, |s| s > 70) {
-                let name = group_name(&current);
+                let name = format_group_name(&current);
                 groups.push(ClipGroup {
                     pairs: std::mem::take(&mut current),
                     name,
@@ -121,7 +121,7 @@ pub fn find_groups(input_dir: &Path) -> Result<Vec<ClipGroup>> {
         current.push(pair);
     }
     if !current.is_empty() {
-        let name = group_name(&current);
+        let name = format_group_name(&current);
         groups.push(ClipGroup {
             pairs: current,
             name,
@@ -131,17 +131,17 @@ pub fn find_groups(input_dir: &Path) -> Result<Vec<ClipGroup>> {
     Ok(groups)
 }
 
-fn clip_datetime(clip: &Clip) -> Option<NaiveDateTime> {
+fn parse_datetime(clip: &Clip) -> Option<NaiveDateTime> {
     let s = format!("{}{}", clip.date, clip.time);
     NaiveDateTime::parse_from_str(&s, "%y%m%d%H%M%S").ok()
 }
 
-fn group_name(pairs: &[ClipPair]) -> String {
+fn format_group_name(pairs: &[ClipPair]) -> String {
     let first = &pairs.first().unwrap().front;
     let last = &pairs.last().unwrap().front;
 
-    // "to" = last clip start + 60 s (actual end), handles cross-day
-    if let (Some(from), Some(to)) = (clip_datetime(first), clip_datetime(last)) {
+    // Format: "YYMMDD_HHMMSS-YYMMDD_HHMMSS" spanning first to last clip start
+    if let (Some(from), Some(to)) = (parse_datetime(first), parse_datetime(last)) {
         format!(
             "{}_{}-{}_{}",
             from.format("%y%m%d"),

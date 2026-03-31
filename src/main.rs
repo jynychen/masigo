@@ -1,4 +1,5 @@
 mod clip;
+mod ffprobe;
 mod gps;
 mod overlay;
 mod process;
@@ -23,6 +24,10 @@ struct Cli {
     /// 輸出目錄
     #[arg(short, long, default_value = "vid_out")]
     output: PathBuf,
+
+    /// 略過確認提示，直接開始處理
+    #[arg(short, long)]
+    yes: bool,
 }
 
 fn main() -> Result<()> {
@@ -40,7 +45,7 @@ fn main() -> Result<()> {
 
     // ── Step 1: 掃描影片，找出連續片段 ──
     println!("=== Step 1: 掃描影片，建立工作清單 ===\n");
-    let groups = clip::find_groups(&cli.input)?;
+    let groups = clip::scan_clip_groups(&cli.input)?;
 
     if groups.is_empty() {
         println!("no valid clip groups found in {}", cli.input.display());
@@ -54,13 +59,15 @@ fn main() -> Result<()> {
         }
     }
 
-    print!("\n是否開始處理？(y/n): ");
-    io::stdout().flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    if answer.trim().to_lowercase() != "y" {
-        println!("已取消");
-        return Ok(());
+    if !cli.yes {
+        print!("\n是否開始處理？(y/n): ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if answer.trim().to_lowercase() != "y" {
+            println!("已取消");
+            return Ok(());
+        }
     }
 
     // ── Steps 2–6: 逐組處理 ──
@@ -75,7 +82,7 @@ fn main() -> Result<()> {
 
         // Step 2: concat Front
         println!("=== Step 2: 串接前鏡頭 ===");
-        let front_file = process::concat_videos(group, &cli.output, Direction::Front)?;
+        let front_file = process::concatenate_clips(group, &cli.output, Direction::Front)?;
         println!("F -> {}", front_file.display());
         if interrupted.load(Ordering::SeqCst) {
             println!("\nUser interrupted, stopping processing.");
@@ -84,7 +91,7 @@ fn main() -> Result<()> {
 
         // Step 3: concat Rear
         println!("=== Step 3: 串接後鏡頭 ===");
-        let rear_file = process::concat_videos(group, &cli.output, Direction::Rear)?;
+        let rear_file = process::concatenate_clips(group, &cli.output, Direction::Rear)?;
         println!("R -> {}", rear_file.display());
         if interrupted.load(Ordering::SeqCst) {
             println!("\nUser interrupted, stopping processing.");
@@ -93,7 +100,7 @@ fn main() -> Result<()> {
 
         // Step 4: GPS
         println!("=== Step 4: 解析 GPS ===");
-        let gps_points = match gps::extract_gps_points(&group.front_paths()) {
+        let gps_points = match gps::extract_gps_track(&group.front_paths()) {
             Ok(pts) => {
                 println!("{} GPS points", pts.len());
                 Some(pts)
@@ -104,14 +111,14 @@ fn main() -> Result<()> {
             }
         };
 
-        // Step 5: GPS overlay
+        // Step 5: overlay
         let overlay_file = if let Some(ref pts) = gps_points {
             if interrupted.load(Ordering::SeqCst) {
                 println!("\nUser interrupted, stopping processing.");
                 return Ok(());
             }
             println!("=== Step 5: 生成 GPS 軌跡 overlay ===");
-            let (fps, duration) = gps::get_video_info(&front_file)?;
+            let (fps, duration) = ffprobe::probe_video_info(&front_file)?;
             println!("影片 {fps:.2} fps, {duration:.1}s");
             match overlay::render_overlay_video(pts, &cli.output, &group.name, fps, duration) {
                 Ok(path) => {
@@ -134,7 +141,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         println!("=== Step 6: PIP 合成 ===");
-        let final_file = process::pip_composite(
+        let final_file = process::compose_pip(
             &front_file,
             &rear_file,
             overlay_file.as_deref(),

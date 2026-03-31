@@ -5,8 +5,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::clip::{ClipGroup, Direction};
 
-/// Steps 3 & 4: Concatenate clips of a given direction using ffmpeg
-pub fn concat_videos(
+/// Concatenate clips of a given direction into a single file using ffmpeg.
+pub fn concatenate_clips(
     group: &ClipGroup,
     output_dir: &Path,
     direction: Direction,
@@ -61,9 +61,9 @@ pub fn concat_videos(
     Ok(output_file)
 }
 
-/// Step 6: PIP composite – rear camera cropped & scaled on top of front camera
-/// If overlay_file is provided, it is composited in the top-right corner.
-pub fn pip_composite(
+/// Composite rear camera (cropped & scaled) on top of front camera as PIP.
+/// If `overlay_file` is provided, it is composited in the bottom-right corner.
+pub fn compose_pip(
     front_file: &Path,
     rear_file: &Path,
     overlay_file: Option<&Path>,
