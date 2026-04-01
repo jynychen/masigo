@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
 use regex::Regex;
 
+use crate::ffprobe::probe_video_info;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Direction {
     Front,
@@ -102,7 +104,16 @@ pub fn scan_clip_groups(input_dir: &Path) -> Result<Vec<ClipGroup>> {
     // BTreeMap already sorted by key, but sort explicitly for clarity
     pairs.sort_by_key(|p| p.seq);
 
-    // Split into consecutive groups (gap > 70 s → new group)
+    // Determine gap threshold from the first clip's actual duration so that
+    // both 1-minute (~60 s) and 3-minute (~180 s) clips are grouped correctly.
+    // Threshold = clip_duration + 10 s; fallback to 70 s if probing fails.
+    let gap_threshold: i64 = pairs
+        .first()
+        .and_then(|p| probe_video_info(&p.front.path).ok())
+        .map(|(_, d)| (d + 10.0).ceil() as i64)
+        .unwrap_or(70);
+
+    // Split into consecutive groups (gap > gap_threshold → new group)
     let mut groups: Vec<ClipGroup> = Vec::new();
     let mut current: Vec<ClipPair> = Vec::new();
 
@@ -110,7 +121,7 @@ pub fn scan_clip_groups(input_dir: &Path) -> Result<Vec<ClipGroup>> {
         if let Some(last) = current.last() {
             let gap = parse_datetime(&pair.front)
                 .and_then(|t| parse_datetime(&last.front).map(|p| (t - p).num_seconds()));
-            if gap.map_or(true, |s| s > 70) {
+            if gap.map_or(true, |s| s > gap_threshold) {
                 let name = format_group_name(&current);
                 groups.push(ClipGroup {
                     pairs: std::mem::take(&mut current),
