@@ -55,6 +55,9 @@ pub fn render_overlay_video(
         })
         .collect();
 
+    // Pre-compute anti-aliased track raster (once for entire video).
+    let raster = TrackRaster::precompute(&track_fps_px, size, 2.0, 3.0);
+
     // Spawn ffmpeg: raw RGBA in → qtrle .mov out (preserves alpha)
     let mut ffmpeg = Command::new("ffmpeg")
         .args([
@@ -96,7 +99,7 @@ pub fn render_overlay_video(
                 .into_par_iter()
                 .map(|frame_idx| {
                     let mut buf = vec![0u8; frame_len];
-                    render_frame(&mut buf, &track_fps_px, frame_idx, size);
+                    render_frame(&mut buf, &raster, &track_fps_px, frame_idx, size);
                     buf
                 })
                 .collect();
@@ -453,146 +456,220 @@ impl Viewport {
     }
 }
 
+// ── Track pre-computation ─────────────────────────────────────────────────────
+//
+// Rasterise the entire polyline once into per-pixel metadata so that each
+// video frame can be produced with a single flat pixel loop (O(size²) per
+// frame) instead of re-drawing every line segment.
+
+struct TrackRaster {
+    /// Per pixel: lowest segment index whose thick-radius coverage > 0.
+    /// `u32::MAX` means no segment touches this pixel.
+    min_seg: Vec<u32>,
+    /// Per pixel: max anti-aliased coverage at the thick (past-track) radius.
+    cov_thick: Vec<f32>,
+    /// Per pixel: max anti-aliased coverage at the thin (future-track) radius.
+    cov_thin: Vec<f32>,
+}
+
+impl TrackRaster {
+    /// Build the raster from the fps-resolution pixel track.
+    ///
+    /// `radius_thin` / `radius_thick` are the half-widths used for future
+    /// (gray) and past (white) track rendering respectively.
+    fn precompute(
+        track: &[(f32, f32, bool)],
+        size: u32,
+        radius_thin: f32,
+        radius_thick: f32,
+    ) -> Self {
+        let n = (size * size) as usize;
+        let mut min_seg = vec![u32::MAX; n];
+        let mut cov_thick = vec![0.0f32; n];
+        let mut cov_thin = vec![0.0f32; n];
+
+        let outer = radius_thick + 0.5; // bounding-box expansion
+
+        for seg_idx in 0..track.len().saturating_sub(1) {
+            let (x0, y0, v0) = track[seg_idx];
+            let (x1, y1, v1) = track[seg_idx + 1];
+            if !v0 || !v1 {
+                continue;
+            }
+
+            let px_min = (x0.min(x1) - outer).floor().max(0.0) as u32;
+            let px_max = (x0.max(x1) + outer).ceil().min(size as f32 - 1.0) as u32;
+            let py_min = (y0.min(y1) - outer).floor().max(0.0) as u32;
+            let py_max = (y0.max(y1) + outer).ceil().min(size as f32 - 1.0) as u32;
+
+            let si = seg_idx as u32;
+
+            for py in py_min..=py_max {
+                let row_off = (py * size) as usize;
+                for px in px_min..=px_max {
+                    let d = dist_to_segment(
+                        px as f32 + 0.5,
+                        py as f32 + 0.5,
+                        x0,
+                        y0,
+                        x1,
+                        y1,
+                    );
+                    let ct = smoothstep(radius_thick + 0.5, radius_thick - 0.5, d);
+                    if ct > 0.0 {
+                        let idx = row_off + px as usize;
+                        if si < min_seg[idx] {
+                            min_seg[idx] = si;
+                        }
+                        if ct > cov_thick[idx] {
+                            cov_thick[idx] = ct;
+                        }
+                        let cn = smoothstep(radius_thin + 0.5, radius_thin - 0.5, d);
+                        if cn > cov_thin[idx] {
+                            cov_thin[idx] = cn;
+                        }
+                    }
+                }
+            }
+        }
+
+        TrackRaster {
+            min_seg,
+            cov_thick,
+            cov_thin,
+        }
+    }
+}
+
 // ── Frame rendering ───────────────────────────────────────────────────────────
 
 fn render_frame(
     buf: &mut [u8],
+    raster: &TrackRaster,
     track_fps_px: &[(f32, f32, bool)],
     frame_idx: usize,
     size: u32,
 ) {
-    buf.fill(0); // clear to fully transparent
+    let fi = frame_idx as u32;
+    let npx = (size * size) as usize;
 
-    // Draw future track (gray, underneath).
-    let gray = [128, 128, 128, 180u8];
-    for i in frame_idx..track_fps_px.len().saturating_sub(1) {
-        let (x0, y0, _) = track_fps_px[i];
-        let (x1, y1, _) = track_fps_px[i + 1];
-        draw_thick_line(buf, size, (x0, y0), (x1, y1), &gray, 2);
+    // Gray (future) / white (past) — base RGB + target opacity.
+    const GRAY: [u8; 3] = [128, 128, 128];
+    const GRAY_A: f32 = 180.0 / 255.0;
+    const WHITE: [u8; 3] = [255, 255, 255];
+    const WHITE_A: f32 = 230.0 / 255.0;
+
+    for i in 0..npx {
+        let px = i * 4;
+        let ms = raster.min_seg[i];
+
+        if ms == u32::MAX {
+            // No track coverage — fully transparent.
+            buf[px] = 0;
+            buf[px + 1] = 0;
+            buf[px + 2] = 0;
+            buf[px + 3] = 0;
+            continue;
+        }
+
+        if ms < fi {
+            // At least one past segment covers this pixel → white.
+            let a = (raster.cov_thick[i] * WHITE_A * 255.0 + 0.5) as u8;
+            buf[px] = WHITE[0];
+            buf[px + 1] = WHITE[1];
+            buf[px + 2] = WHITE[2];
+            buf[px + 3] = a;
+        } else if raster.cov_thin[i] > 0.0 {
+            // Only future segments within the thin radius → gray.
+            let a = (raster.cov_thin[i] * GRAY_A * 255.0 + 0.5) as u8;
+            buf[px] = GRAY[0];
+            buf[px + 1] = GRAY[1];
+            buf[px + 2] = GRAY[2];
+            buf[px + 3] = a;
+        } else {
+            // Future segment in thick-only ring (outside thin radius) — hide.
+            buf[px] = 0;
+            buf[px + 1] = 0;
+            buf[px + 2] = 0;
+            buf[px + 3] = 0;
+        }
     }
 
-    // Draw past track (white, on top).
-    let white = [255, 255, 255, 230u8];
-    for i in 0..frame_idx {
-        let (x0, y0, _) = track_fps_px[i];
-        let (x1, y1, _) = track_fps_px[i + 1];
-        draw_thick_line(buf, size, (x0, y0), (x1, y1), &white, 3);
-    }
-
-    // Draw current position (red dot) only when the raw fix was valid.
+    // Current position dot (anti-aliased, composited on top).
     if let Some(&(cx, cy, true)) = track_fps_px.get(frame_idx) {
-        let red = [255, 50, 50, 255u8];
-        draw_filled_circle(buf, size, cx as i32, cy as i32, 8, &red);
+        draw_aa_circle(buf, size, cx, cy, 8.0, [255, 50, 50]);
     }
 }
 
-// ── Drawing primitives ────────────────────────────────────────────────────────
+// ── Drawing helpers ───────────────────────────────────────────────────────────
 
-fn draw_thick_line(
-    buf: &mut [u8],
-    size: u32,
-    start: (f32, f32),
-    end: (f32, f32),
-    color: &[u8; 4],
-    thickness: i32,
-) {
-    let w = size as i32;
-    let h = size as i32;
-
-    let (x0, y0) = start;
-    let (x1, y1) = end;
+/// Shortest distance from point `(px, py)` to the line segment `(x0,y0)→(x1,y1)`.
+#[inline]
+fn dist_to_segment(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
     let dx = x1 - x0;
     let dy = y1 - y0;
-    let len = (dx * dx + dy * dy).sqrt();
-    if len < 0.5 {
-        draw_filled_circle(buf, size, x0 as i32, y0 as i32, thickness, color);
-        return;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 1e-6 {
+        return ((px - x0).powi(2) + (py - y0).powi(2)).sqrt();
     }
+    let t = (((px - x0) * dx + (py - y0) * dy) / len_sq).clamp(0.0, 1.0);
+    let proj_x = x0 + t * dx;
+    let proj_y = y0 + t * dy;
+    ((px - proj_x).powi(2) + (py - proj_y).powi(2)).sqrt()
+}
 
-    // Pre-compute circle offsets once — avoids repeated ox²+oy²≤r² check per step.
-    let offsets: Vec<(i32, i32)> = (-thickness..=thickness)
-        .flat_map(|oy| {
-            (-thickness..=thickness).filter_map(move |ox| {
-                if ox * ox + oy * oy <= thickness * thickness {
-                    Some((ox, oy))
-                } else {
-                    None
-                }
-            })
-        })
-        .collect();
+/// Hermite smoothstep mapping: returns 0 outside `edge0`, 1 inside `edge1`,
+/// with a smooth transition in between.  Works when `edge0 > edge1`
+/// (outer → 0, inner → 1) which is the typical distance-field convention.
+#[inline]
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
 
-    let steps = (len * 2.0) as i32;
-    for step in 0..=steps {
-        let t = step as f32 / steps as f32;
-        let px = (x0 + dx * t) as i32;
-        let py = (y0 + dy * t) as i32;
+/// Draw an anti-aliased filled circle using distance-field coverage,
+/// composited onto the existing buffer via "source over".
+fn draw_aa_circle(buf: &mut [u8], size: u32, cx: f32, cy: f32, radius: f32, rgb: [u8; 3]) {
+    let outer = radius + 0.5;
+    let s = size as f32;
+    let px_min = (cx - outer).floor().max(0.0) as u32;
+    let px_max = (cx + outer).ceil().min(s - 1.0) as u32;
+    let py_min = (cy - outer).floor().max(0.0) as u32;
+    let py_max = (cy + outer).ceil().min(s - 1.0) as u32;
 
-        for &(ox, oy) in &offsets {
-            let ix = px + ox;
-            let iy = py + oy;
-            if ix >= 0 && ix < w && iy >= 0 && iy < h {
-                alpha_blend_pixel(buf, size, ix as u32, iy as u32, color);
+    for py in py_min..=py_max {
+        for px in px_min..=px_max {
+            let dx = px as f32 + 0.5 - cx;
+            let dy = py as f32 + 0.5 - cy;
+            let d = (dx * dx + dy * dy).sqrt();
+            let cov = smoothstep(radius + 0.5, radius - 0.5, d);
+            if cov <= 0.0 {
+                continue;
+            }
+
+            let sa = (cov * 255.0 + 0.5) as u32;
+            let idx = ((py * size + px) * 4) as usize;
+            let da = buf[idx + 3] as u32;
+
+            if da == 0 || sa >= 255 {
+                buf[idx] = rgb[0];
+                buf[idx + 1] = rgb[1];
+                buf[idx + 2] = rgb[2];
+                buf[idx + 3] = sa.min(255) as u8;
+            } else {
+                // General "source over" compositing.
+                let inv_sa = 255 - sa;
+                let da_f = (da * inv_sa + 127) / 255;
+                let out_a = sa + da_f;
+                let h = out_a / 2;
+                buf[idx] =
+                    ((rgb[0] as u32 * sa + buf[idx] as u32 * da_f + h) / out_a) as u8;
+                buf[idx + 1] =
+                    ((rgb[1] as u32 * sa + buf[idx + 1] as u32 * da_f + h) / out_a) as u8;
+                buf[idx + 2] =
+                    ((rgb[2] as u32 * sa + buf[idx + 2] as u32 * da_f + h) / out_a) as u8;
+                buf[idx + 3] = out_a as u8;
             }
         }
     }
-}
-
-fn draw_filled_circle(buf: &mut [u8], size: u32, cx: i32, cy: i32, radius: i32, color: &[u8; 4]) {
-    let w = size as i32;
-    let h = size as i32;
-    for dy in -radius..=radius {
-        for dx in -radius..=radius {
-            if dx * dx + dy * dy <= radius * radius {
-                let px = cx + dx;
-                let py = cy + dy;
-                if px >= 0 && px < w && py >= 0 && py < h {
-                    alpha_blend_pixel(buf, size, px as u32, py as u32, color);
-                }
-            }
-        }
-    }
-}
-
-fn alpha_blend_pixel(buf: &mut [u8], size: u32, x: u32, y: u32, src: &[u8; 4]) {
-    let idx = ((y * size + x) * 4) as usize;
-
-    let sa = src[3] as u32;
-    if sa == 0 {
-        return;
-    }
-
-    let da = buf[idx + 3] as u32;
-
-    // Fast path: destination transparent — no blending needed.
-    if da == 0 {
-        buf[idx] = src[0];
-        buf[idx + 1] = src[1];
-        buf[idx + 2] = src[2];
-        buf[idx + 3] = sa as u8;
-        return;
-    }
-
-    // Fast path: source fully opaque — just overwrite.
-    if sa == 255 {
-        buf[idx] = src[0];
-        buf[idx + 1] = src[1];
-        buf[idx + 2] = src[2];
-        buf[idx + 3] = 255;
-        return;
-    }
-
-    // General case: integer "source over" compositing.
-    // out_a   = sa + da*(1 - sa/255)  = sa + da*inv_sa/255
-    // out_rgb = (src_rgb*sa + dst_rgb*da_factor) / out_a
-    //   where da_factor = da*inv_sa/255
-    let inv_sa = 255 - sa;
-    let da_factor = (da * inv_sa + 127) / 255;
-    let out_a = sa + da_factor;
-
-    let half = out_a / 2;
-    buf[idx] = ((src[0] as u32 * sa + buf[idx] as u32 * da_factor + half) / out_a) as u8;
-    buf[idx + 1] = ((src[1] as u32 * sa + buf[idx + 1] as u32 * da_factor + half) / out_a) as u8;
-    buf[idx + 2] = ((src[2] as u32 * sa + buf[idx + 2] as u32 * da_factor + half) / out_a) as u8;
-    buf[idx + 3] = out_a as u8;
 }
