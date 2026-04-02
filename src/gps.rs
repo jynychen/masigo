@@ -1,3 +1,4 @@
+use core::f64;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -8,15 +9,36 @@ use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 
 use crate::ffprobe::probe_video_info;
 
+const FREEGPS_MAGIC: &[u8] = b"freeGPS ";
+/// Bytes needed to cover all binary header fields (through accel_y at 0x64–0x67).
+const HEADER_LEN: usize = 0x68;
+
+/// One second of freeGPS data.  All fields are always populated from the binary
+/// header; `fix` indicates whether the GPS position is valid.
 #[derive(Debug, Clone)]
-pub struct GnrmcFix {
+pub struct Gnrmc {
+    /// `true` when the status byte is `'A'` (valid GPS fix).
+    pub fix: bool,
+    /// UTC timestamp from the binary header date/time fields.
+    /// Valid even when `fix == false`.
+    pub time: SystemTime,
+    /// Decimal degrees (WGS-84).  `f64::NAN` when `!fix`.
     pub lat: f64,
     pub lon: f64,
-    /// UTC timestamp of this GPS entry, parsed from the GNRMC sentence.
-    /// For invalid entries (no fix / no sentence), derived by ±1 s offset
-    /// from the nearest entry that has a parseable time.
-    pub time: SystemTime,
-    // add speed
+    /// Speed over ground in km/h.  `f64::NAN` when `!fix`.
+    #[allow(dead_code)]
+    pub speed: f64,
+    /// True course / heading in degrees.  `f64::NAN` when `!fix`.
+    #[allow(dead_code)]
+    pub track: f64,
+    /// Accelerometer in g
+    /// Z ≈ 1.0 at rest (gravity axis).  Always valid.
+    #[allow(dead_code)]
+    pub accel_z: f64,
+    #[allow(dead_code)]
+    pub accel_x: f64,
+    #[allow(dead_code)]
+    pub accel_y: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -25,17 +47,12 @@ pub struct GpsPoint {
     pub file_path: PathBuf,
     /// 0-based global second index across all clips in the group.
     pub frame_index: usize,
-
-    /// GNRMC-derived position data.  `None` when no valid GNRMC fix was
-    /// obtained (no sentence, parse failure, or status != 'A').
-    pub gnrmc: Option<GnrmcFix>,
+    pub gnrmc: Gnrmc,
 }
 
 /// Extract 1 Hz GPS track from freeGPS boxes embedded in the front clips.
 ///
-/// Returns one `GpsPoint` per second (= total video duration).  Entries with a
-/// valid GNRMC/GPRMC fix (status 'A') carry `gnrmc: Some(GnrmcFix)`;
-/// entries without a fix have `gnrmc: None`.
+/// Returns one `GpsPoint` per second (= total video duration).
 pub fn extract_gps_track(front_paths: &[&Path]) -> Result<Vec<GpsPoint>> {
     let mut result: Vec<GpsPoint> = Vec::new();
     let mut global_offset: usize = 0;
@@ -60,34 +77,16 @@ pub fn extract_gps_track(front_paths: &[&Path]) -> Result<Vec<GpsPoint>> {
 
         let mut file =
             File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-        let mut sample = vec![0u8; 300];
+        let mut buf = vec![0u8; HEADER_LEN];
 
         for (i, (file_offset, _)) in entries.iter().enumerate() {
             file.seek(SeekFrom::Start(*file_offset))?;
-            file.read_exact(&mut sample)?;
-
-            let frame_index = global_offset + i;
-            let gnrmc = find_rmc_sentence(&sample).and_then(|s| {
-                let parts: Vec<&str> = s.split(',').collect();
-                if parts.get(2).copied() != Some("A") {
-                    return None;
-                }
-                let lat = parts
-                    .get(3)
-                    .and_then(|v| parts.get(4).map(|h| nmea_to_decimal_degrees(v, h)))
-                    .flatten()?;
-                let lon = parts
-                    .get(5)
-                    .and_then(|v| parts.get(6).map(|h| nmea_to_decimal_degrees(v, h)))
-                    .flatten()?;
-                let time = parse_rmc_timestamp(s)?;
-                Some(GnrmcFix { lat, lon, time })
-            });
+            file.read_exact(&mut buf)?;
 
             result.push(GpsPoint {
                 file_path: path.to_path_buf(),
-                frame_index,
-                gnrmc,
+                frame_index: global_offset + i,
+                gnrmc: parse_freegps_header(&buf),
             });
         }
 
@@ -155,58 +154,102 @@ fn read_gps_box_entries(path: &Path) -> Result<Vec<(u64, u32)>> {
     Ok(entries)
 }
 
-// ── NMEA parsing ──────────────────────────────────────────────────────────────
+// ── freeGPS sample header ─────────────────────────────────────────────────────
+//
+// All fields are little-endian.  Layout (offsets in hex):
+//   0x00  u32    block size (always 0x4000)
+//   0x04  8B     magic "freeGPS "
+//   0x0c  u32    (reserved)
+//   0x10  u32    UTC hour
+//   0x14  u32    UTC minute
+//   0x18  u32    UTC second
+//   0x1c  u8     GPS status  'A' = valid fix  'V' = void
+//   0x20  f64    latitude  in NMEA ddmm.mmmmm
+//   0x28  u8     N / S
+//   0x30  f64    longitude in NMEA dddmm.mmmmm
+//   0x38  u8     E / W
+//   0x40  f64    speed over ground (knots)
+//   0x48  f64    true course / heading (degrees)
+//   0x50  u32    year  (2-digit, e.g. 26 → 2026)
+//   0x54  u32    month
+//   0x58  u32    day
+//   0x5c  i32    accelerometer Z  (÷ 1000 → g; ~1.0 at rest)
+//   0x60  i32    accelerometer X  (÷ 1000 → g)
+//   0x64  i32    accelerometer Y  (÷ 1000 → g)
+//   0x68  …      ' ' + NMEA sentence ($GNRMC / $GPRMC)
 
-/// Find the first `$GNRMC` or `$GPRMC` sentence in a raw byte buffer.
-fn find_rmc_sentence(buf: &[u8]) -> Option<&str> {
-    for sig in [b"$GNRMC".as_ref(), b"$GPRMC".as_ref()] {
-        if let Some(start) = buf.windows(sig.len()).position(|w| w == sig) {
-            let end = buf[start..]
-                .iter()
-                .position(|&b| b == b'\n' || b == b'\r')
-                .map(|p| start + p)
-                .unwrap_or(buf.len());
-            return std::str::from_utf8(&buf[start..end]).ok();
-        }
+fn parse_freegps_header(buf: &[u8]) -> Gnrmc {
+    if buf.len() < HEADER_LEN || &buf[4..12] != FREEGPS_MAGIC {
+        return Gnrmc {
+            fix: false,
+            time: SystemTime::UNIX_EPOCH,
+            lat: f64::NAN,
+            lon: f64::NAN,
+            speed: f64::NAN,
+            track: f64::NAN,
+            accel_z: f64::NAN,
+            accel_x: f64::NAN,
+            accel_y: f64::NAN,
+        };
     }
-    None
+
+    let time = build_timestamp(
+        le_u32(buf, 0x50),
+        le_u32(buf, 0x54),
+        le_u32(buf, 0x58),
+        le_u32(buf, 0x10),
+        le_u32(buf, 0x14),
+        le_u32(buf, 0x18),
+    )
+    .unwrap_or(SystemTime::UNIX_EPOCH);
+
+    Gnrmc {
+        fix: buf[0x1c] == b'A',
+        time,
+        lat: nmea_to_decimal(le_f64(buf, 0x20), buf[0x28] as char),
+        lon: nmea_to_decimal(le_f64(buf, 0x30), buf[0x38] as char),
+        speed: le_f64(buf, 0x40) * 1.852,
+        track: le_f64(buf, 0x48),
+        accel_z: le_i32(buf, 0x5c) as f64 / 1000.0,
+        accel_x: le_i32(buf, 0x60) as f64 / 1000.0,
+        accel_y: le_i32(buf, 0x64) as f64 / 1000.0,
+    }
 }
 
-/// Parse UTC timestamp (fields 1 + 9) from an RMC sentence into `SystemTime`.
-fn parse_rmc_timestamp(sentence: &str) -> Option<SystemTime> {
-    let parts: Vec<&str> = sentence.split(',').collect();
-    let time_str = parts.get(1)?;
-    let date_str = parts.get(9)?;
+// ── helpers ───────────────────────────────────────────────────────────────────
 
-    if time_str.len() < 6 || date_str.len() < 6 {
-        return None;
-    }
-
-    let hh: u32 = time_str[0..2].parse().ok()?;
-    let mm: u32 = time_str[2..4].parse().ok()?;
-    let ss: u32 = time_str[4..6].parse().ok()?;
-    let dd: u32 = date_str[0..2].parse().ok()?;
-    let mo: u32 = date_str[2..4].parse().ok()?;
-    let yy: u32 = date_str[4..6].parse().ok()?;
-
-    let date = NaiveDate::from_ymd_opt(2000 + yy as i32, mo, dd)?;
-    let time = NaiveTime::from_hms_opt(hh, mm, ss)?;
-    let dt = NaiveDateTime::new(date, time);
-    Some(SystemTime::from(Utc.from_utc_datetime(&dt)))
+#[inline]
+fn le_u32(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+}
+#[inline]
+fn le_i32(buf: &[u8], off: usize) -> i32 {
+    i32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+}
+#[inline]
+fn le_f64(buf: &[u8], off: usize) -> f64 {
+    f64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
 }
 
-/// Convert NMEA coordinate (`ddmm.mmmmm` or `dddmm.mmmmm`) and hemisphere
-/// letter to decimal degrees.
-fn nmea_to_decimal_degrees(coord: &str, hemi: &str) -> Option<f64> {
-    if coord.is_empty() {
-        return None;
-    }
-    let dot = coord.find('.')?;
-    if dot < 2 {
-        return None;
-    }
-    let deg: f64 = coord[..dot - 2].parse().ok()?;
-    let min: f64 = coord[dot - 2..].parse().ok()?;
-    let dd = deg + min / 60.0;
-    Some(if hemi == "S" || hemi == "W" { -dd } else { dd })
+/// Convert NMEA-format coordinate (ddmm.mmmmm as f64) + hemisphere to decimal degrees.
+fn nmea_to_decimal(coord: f64, hemi: char) -> f64 {
+    let degrees = (coord / 100.0).floor();
+    let minutes = coord - degrees * 100.0;
+    let dd = degrees + minutes / 60.0;
+    if hemi == 'S' || hemi == 'W' { -dd } else { dd }
+}
+
+fn build_timestamp(
+    year: u32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<SystemTime> {
+    let date = NaiveDate::from_ymd_opt(2000 + year as i32, month, day)?;
+    let time = NaiveTime::from_hms_opt(hour, minute, second)?;
+    Some(SystemTime::from(
+        Utc.from_utc_datetime(&NaiveDateTime::new(date, time)),
+    ))
 }

@@ -3,9 +3,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
+use rayon::prelude::*;
+
 use anyhow::{Context, Result, bail};
 
-use crate::gps::{GnrmcFix, GpsPoint};
+use crate::gps::{Gnrmc, GpsPoint};
 
 const OVERLAY_SIZE: u32 = 480;
 const PADDING_RATIO: f64 = 0.05;
@@ -34,25 +36,31 @@ pub fn render_overlay_video(
     // Pre-compute viewport (fixed for entire video, fits entire upsampled track)
     let viewport = Viewport::from_track(&rmc_upsampled, size);
 
-    // 1 Hz track pixels for line drawing (segments are long enough to be visible).
-    let track_1hz_px: Vec<Option<(f32, f32)>> = rmc_filled
-        .iter()
-        .map(|p| p.gnrmc.as_ref().map(|g| viewport.to_pixel(g.lat, g.lon)))
-        .collect();
+    // Validity at 1 Hz from the raw (unfilled) track.
+    let rmc_raw_valid: Vec<bool> = rmc_raw.iter().map(|p| p.gnrmc.fix).collect();
 
-    // Upsampled pixel positions (at target fps) for red-dot / smooth split.
-    let track_fps_px: Vec<Option<(f32, f32)>> = rmc_upsampled
+    // Fps-resolution pixel track: position from upsampled spline, validity from rmc_raw.
+    let track_fps_px: Vec<(f32, f32, bool)> = rmc_upsampled
         .iter()
-        .map(|p| p.gnrmc.as_ref().map(|g| viewport.to_pixel(g.lat, g.lon)))
+        .enumerate()
+        .map(|(frame_idx, p)| {
+            let (x, y) = if p.gnrmc.fix {
+                viewport.to_pixel(p.gnrmc.lat, p.gnrmc.lon)
+            } else {
+                (0.0, 0.0)
+            };
+            let hz1_idx = ((frame_idx + 1) as f64 / fps).floor() as usize;
+            let valid = rmc_raw_valid.get(hz1_idx).copied().unwrap_or(false);
+            (x, y, valid)
+        })
         .collect();
-
-    // Original 1 Hz validity: true when the raw entry had a GNRMC fix.
-    let rmc_valid: Vec<bool> = rmc_raw.iter().map(|p| p.gnrmc.is_some()).collect();
 
     // Spawn ffmpeg: raw RGBA in → qtrle .mov out (preserves alpha)
     let mut ffmpeg = Command::new("ffmpeg")
         .args([
             "-y",
+            "-loglevel",
+            "warning",
             "-f",
             "rawvideo",
             "-pix_fmt",
@@ -70,36 +78,31 @@ pub fn render_overlay_video(
             output_file.to_str().unwrap(),
         ])
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .spawn()
         .context("Failed to spawn ffmpeg for overlay")?;
 
     let stdin = ffmpeg.stdin.as_mut().context("No ffmpeg stdin")?;
     let total_frames = rmc_upsampled.len();
     let frame_len = (size * size * 4) as usize;
-    let mut buf = vec![0u8; frame_len]; // reused across frames
+
+    // Render frames in parallel chunks, write each chunk sequentially to ffmpeg.
+    // Chunk size = 2× thread count keeps all cores busy without buffering too much.
+    let chunk_size = rayon::current_num_threads() * 2;
 
     let result = (|| -> Result<()> {
-        for frame_idx in 0..total_frames {
-            render_frame(
-                &mut buf,
-                &track_1hz_px,
-                &track_fps_px,
-                &rmc_valid,
-                frame_idx,
-                fps,
-                size,
-            );
-            stdin.write_all(&buf)?;
+        for chunk_start in (0..total_frames).step_by(chunk_size) {
+            let chunk_end = (chunk_start + chunk_size).min(total_frames);
+            let frames: Vec<Vec<u8>> = (chunk_start..chunk_end)
+                .into_par_iter()
+                .map(|frame_idx| {
+                    let mut buf = vec![0u8; frame_len];
+                    render_frame(&mut buf, &track_fps_px, frame_idx, size);
+                    buf
+                })
+                .collect();
 
-            if frame_idx % 300 == 0 {
-                eprint!(
-                    "\r    overlay: {}/{} frames ({:.0}%)",
-                    frame_idx,
-                    total_frames,
-                    frame_idx as f64 / total_frames as f64 * 100.0
-                );
+            for frame_buf in frames.iter() {
+                stdin.write_all(frame_buf)?;
             }
         }
         Ok(())
@@ -127,10 +130,7 @@ pub fn render_overlay_video(
 
 /// Unpack lat/lon and validity flag from a `GpsPoint`.
 fn unpack_coords(p: &GpsPoint) -> (f64, f64, bool) {
-    match &p.gnrmc {
-        Some(g) => (g.lat, g.lon, true),
-        None => (f64::NAN, f64::NAN, false),
-    }
+    (p.gnrmc.lat, p.gnrmc.lon, p.gnrmc.fix)
 }
 
 /// Upsample 1 Hz GPS points to `target_fps` via cubic spline interpolation.
@@ -145,16 +145,15 @@ fn upsample_to_fps(points: &[GpsPoint], target_fps: f64, total_duration_sec: f64
         .map(|p| (p.frame_index - base_index) as f64)
         .collect();
 
-    let base_time = points.iter().find_map(|p| p.gnrmc.as_ref().map(|g| g.time));
+    let base_time = points.first().map(|p| p.gnrmc.time);
 
     // Collect valid points for spline construction.
     let valid_pts: Vec<(f64, f64, f64)> = points
         .iter()
-        .filter(|p| p.gnrmc.is_some())
+        .filter(|p| p.gnrmc.fix)
         .map(|p| {
-            let g = p.gnrmc.as_ref().unwrap();
             let t = (p.frame_index - base_index) as f64;
-            (t, g.lat, g.lon)
+            (t, p.gnrmc.lat, p.gnrmc.lon)
         })
         .collect();
 
@@ -191,13 +190,19 @@ fn upsample_to_fps(points: &[GpsPoint], target_fps: f64, total_duration_sec: f64
             unpack_coords(floor_pt)
         };
 
-        let gnrmc = if valid {
-            let time = base_time
-                .map(|bt| bt + Duration::from_secs_f64(t))
-                .unwrap_or(SystemTime::UNIX_EPOCH + Duration::from_secs_f64(t));
-            Some(GnrmcFix { lat, lon, time })
-        } else {
-            None
+        let time = base_time
+            .map(|bt| bt + Duration::from_secs_f64(t))
+            .unwrap_or(SystemTime::UNIX_EPOCH + Duration::from_secs_f64(t));
+        let gnrmc = Gnrmc {
+            fix: valid,
+            time,
+            lat: if valid { lat } else { f64::NAN },
+            lon: if valid { lon } else { f64::NAN },
+            speed: f64::NAN,
+            track: f64::NAN,
+            accel_z: f64::NAN,
+            accel_x: f64::NAN,
+            accel_y: f64::NAN,
         };
 
         result.push(GpsPoint {
@@ -266,9 +271,7 @@ impl CubicSpline {
             }
 
             let mut ms = vec![0.0f64; n + 1];
-            for i in 0..m {
-                ms[i + 1] = sol[i];
-            }
+            ms[1..=m].copy_from_slice(&sol[..m]);
             ms
         };
 
@@ -304,16 +307,15 @@ impl CubicSpline {
 fn fill_gaps(track: &[GpsPoint]) -> Vec<GpsPoint> {
     let base_index = track.first().map(|p| p.frame_index).unwrap_or(0);
 
-    // Base time from the first valid entry.
-    let base_time = track.iter().find_map(|p| p.gnrmc.as_ref().map(|g| g.time));
+    // Base time from the first entry (time is always valid).
+    let base_time = track.first().map(|p| p.gnrmc.time);
 
     let valid_pts: Vec<(f64, f64, f64)> = track
         .iter()
-        .filter(|p| p.gnrmc.is_some())
+        .filter(|p| p.gnrmc.fix)
         .map(|p| {
-            let g = p.gnrmc.as_ref().unwrap();
             let t = (p.frame_index - base_index) as f64;
-            (t, g.lat, g.lon)
+            (t, p.gnrmc.lat, p.gnrmc.lon)
         })
         .collect();
 
@@ -333,15 +335,21 @@ fn fill_gaps(track: &[GpsPoint]) -> Vec<GpsPoint> {
         return track
             .iter()
             .map(|p| {
-                if p.gnrmc.is_some() {
+                if p.gnrmc.fix {
                     p.clone()
                 } else {
                     GpsPoint {
-                        gnrmc: Some(GnrmcFix {
+                        gnrmc: Gnrmc {
+                            fix: false,
                             lat: fill_lat,
                             lon: fill_lon,
                             time: fill_time(p),
-                        }),
+                            speed: f64::NAN,
+                            track: f64::NAN,
+                            accel_z: f64::NAN,
+                            accel_x: f64::NAN,
+                            accel_y: f64::NAN,
+                        },
                         ..p.clone()
                     }
                 }
@@ -357,16 +365,22 @@ fn fill_gaps(track: &[GpsPoint]) -> Vec<GpsPoint> {
     track
         .iter()
         .map(|p| {
-            if p.gnrmc.is_some() {
+            if p.gnrmc.fix {
                 p.clone()
             } else {
                 let t = (p.frame_index - base_index) as f64;
                 GpsPoint {
-                    gnrmc: Some(GnrmcFix {
+                    gnrmc: Gnrmc {
+                        fix: false,
                         lat: lat_spline.eval(t),
                         lon: lon_spline.eval(t),
                         time: fill_time(p),
-                    }),
+                        speed: f64::NAN,
+                        track: f64::NAN,
+                        accel_z: f64::NAN,
+                        accel_x: f64::NAN,
+                        accel_y: f64::NAN,
+                    },
                     ..p.clone()
                 }
             }
@@ -386,22 +400,26 @@ struct Viewport {
 
 impl Viewport {
     fn from_track(track: &[GpsPoint], size: u32) -> Self {
-        let min_lat = track
+        let (min_lat, max_lat, min_lon, max_lon) = track
             .iter()
-            .map(|p| p.gnrmc.as_ref().map_or(f64::NAN, |g| g.lat))
-            .fold(f64::INFINITY, f64::min);
-        let max_lat = track
-            .iter()
-            .map(|p| p.gnrmc.as_ref().map_or(f64::NAN, |g| g.lat))
-            .fold(f64::NEG_INFINITY, f64::max);
-        let min_lon = track
-            .iter()
-            .map(|p| p.gnrmc.as_ref().map_or(f64::NAN, |g| g.lon))
-            .fold(f64::INFINITY, f64::min);
-        let max_lon = track
-            .iter()
-            .map(|p| p.gnrmc.as_ref().map_or(f64::NAN, |g| g.lon))
-            .fold(f64::NEG_INFINITY, f64::max);
+            .filter(|p| p.gnrmc.fix)
+            .map(|p| (p.gnrmc.lat, p.gnrmc.lon))
+            .fold(
+                (
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                ),
+                |(mn_la, mx_la, mn_lo, mx_lo), (lat, lon)| {
+                    (
+                        mn_la.min(lat),
+                        mx_la.max(lat),
+                        mn_lo.min(lon),
+                        mx_lo.max(lon),
+                    )
+                },
+            );
 
         let center_lat = (min_lat + max_lat) / 2.0;
         let center_lon = (min_lon + max_lon) / 2.0;
@@ -439,57 +457,32 @@ impl Viewport {
 
 fn render_frame(
     buf: &mut [u8],
-    track_1hz_px: &[Option<(f32, f32)>],
-    track_fps_px: &[Option<(f32, f32)>],
-    rmc_valid: &[bool],
+    track_fps_px: &[(f32, f32, bool)],
     frame_idx: usize,
-    fps: f64,
     size: u32,
 ) {
     buf.fill(0); // clear to fully transparent
 
-    // Map fps frame index to the 1 Hz track index.
-    let t_sec = frame_idx as f64 / fps;
-    let split_1hz = (t_sec.floor() as usize).min(track_1hz_px.len().saturating_sub(1));
-
-    // Current upsampled position (for the extra bridging segment + red dot).
-    let cur_pos = track_fps_px.get(frame_idx).copied().flatten();
-
-    // Draw future track (gray, underneath)
+    // Draw future track (gray, underneath).
     let gray = [128, 128, 128, 180u8];
-    // Bridge: current position → next 1 Hz point
-    if let (Some((x0, y0)), Some((x1, y1))) =
-        (cur_pos, track_1hz_px.get(split_1hz + 1).copied().flatten())
-    {
-        draw_thick_line(buf, size, x0, y0, x1, y1, &gray, 2);
-    }
-    for i in (split_1hz + 1)..track_1hz_px.len().saturating_sub(1) {
-        if let (Some((x0, y0)), Some((x1, y1))) = (track_1hz_px[i], track_1hz_px[i + 1]) {
-            draw_thick_line(buf, size, x0, y0, x1, y1, &gray, 2);
-        }
+    for i in frame_idx..track_fps_px.len().saturating_sub(1) {
+        let (x0, y0, _) = track_fps_px[i];
+        let (x1, y1, _) = track_fps_px[i + 1];
+        draw_thick_line(buf, size, (x0, y0), (x1, y1), &gray, 2);
     }
 
-    // Draw past track (white, on top)
+    // Draw past track (white, on top).
     let white = [255, 255, 255, 230u8];
-    for i in 0..split_1hz.min(track_1hz_px.len().saturating_sub(1)) {
-        if let (Some((x0, y0)), Some((x1, y1))) = (track_1hz_px[i], track_1hz_px[i + 1]) {
-            draw_thick_line(buf, size, x0, y0, x1, y1, &white, 3);
-        }
-    }
-    // Bridge: last drawn 1 Hz point → current position
-    if let (Some((x0, y0)), Some((x1, y1))) =
-        (track_1hz_px.get(split_1hz).copied().flatten(), cur_pos)
-    {
-        draw_thick_line(buf, size, x0, y0, x1, y1, &white, 3);
+    for i in 0..frame_idx {
+        let (x0, y0, _) = track_fps_px[i];
+        let (x1, y1, _) = track_fps_px[i + 1];
+        draw_thick_line(buf, size, (x0, y0), (x1, y1), &white, 3);
     }
 
-    // Draw current position (red dot) only when the original 1 Hz entry had a valid fix.
-    let orig_valid = rmc_valid.get(split_1hz).copied().unwrap_or(false);
-    if orig_valid {
-        if let Some((cx, cy)) = cur_pos {
-            let red = [255, 50, 50, 255u8];
-            draw_filled_circle(buf, size, cx as i32, cy as i32, 8, &red);
-        }
+    // Draw current position (red dot) only when the raw fix was valid.
+    if let Some(&(cx, cy, true)) = track_fps_px.get(frame_idx) {
+        let red = [255, 50, 50, 255u8];
+        draw_filled_circle(buf, size, cx as i32, cy as i32, 8, &red);
     }
 }
 
@@ -498,38 +491,48 @@ fn render_frame(
 fn draw_thick_line(
     buf: &mut [u8],
     size: u32,
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
+    start: (f32, f32),
+    end: (f32, f32),
     color: &[u8; 4],
     thickness: i32,
 ) {
     let w = size as i32;
     let h = size as i32;
 
+    let (x0, y0) = start;
+    let (x1, y1) = end;
     let dx = x1 - x0;
     let dy = y1 - y0;
     let len = (dx * dx + dy * dy).sqrt();
     if len < 0.5 {
+        draw_filled_circle(buf, size, x0 as i32, y0 as i32, thickness, color);
         return;
     }
+
+    // Pre-compute circle offsets once — avoids repeated ox²+oy²≤r² check per step.
+    let offsets: Vec<(i32, i32)> = (-thickness..=thickness)
+        .flat_map(|oy| {
+            (-thickness..=thickness).filter_map(move |ox| {
+                if ox * ox + oy * oy <= thickness * thickness {
+                    Some((ox, oy))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
 
     let steps = (len * 2.0) as i32;
     for step in 0..=steps {
         let t = step as f32 / steps as f32;
-        let px = x0 + dx * t;
-        let py = y0 + dy * t;
+        let px = (x0 + dx * t) as i32;
+        let py = (y0 + dy * t) as i32;
 
-        for oy in -thickness..=thickness {
-            for ox in -thickness..=thickness {
-                if ox * ox + oy * oy <= thickness * thickness {
-                    let ix = px as i32 + ox;
-                    let iy = py as i32 + oy;
-                    if ix >= 0 && ix < w && iy >= 0 && iy < h {
-                        alpha_blend_pixel(buf, size, ix as u32, iy as u32, color);
-                    }
-                }
+        for &(ox, oy) in &offsets {
+            let ix = px + ox;
+            let iy = py + oy;
+            if ix >= 0 && ix < w && iy >= 0 && iy < h {
+                alpha_blend_pixel(buf, size, ix as u32, iy as u32, color);
             }
         }
     }
@@ -554,23 +557,42 @@ fn draw_filled_circle(buf: &mut [u8], size: u32, cx: i32, cy: i32, radius: i32, 
 fn alpha_blend_pixel(buf: &mut [u8], size: u32, x: u32, y: u32, src: &[u8; 4]) {
     let idx = ((y * size + x) * 4) as usize;
 
-    let sa = src[3] as f32 / 255.0;
-    let da = buf[idx + 3] as f32 / 255.0;
-    let out_a = sa + da * (1.0 - sa);
-
-    if out_a < 1e-6 {
-        buf[idx] = 0;
-        buf[idx + 1] = 0;
-        buf[idx + 2] = 0;
-        buf[idx + 3] = 0;
+    let sa = src[3] as u32;
+    if sa == 0 {
         return;
     }
 
-    let blend =
-        |s: u8, d: u8| -> u8 { ((s as f32 * sa + d as f32 * da * (1.0 - sa)) / out_a) as u8 };
+    let da = buf[idx + 3] as u32;
 
-    buf[idx] = blend(src[0], buf[idx]);
-    buf[idx + 1] = blend(src[1], buf[idx + 1]);
-    buf[idx + 2] = blend(src[2], buf[idx + 2]);
-    buf[idx + 3] = (out_a * 255.0) as u8;
+    // Fast path: destination transparent — no blending needed.
+    if da == 0 {
+        buf[idx] = src[0];
+        buf[idx + 1] = src[1];
+        buf[idx + 2] = src[2];
+        buf[idx + 3] = sa as u8;
+        return;
+    }
+
+    // Fast path: source fully opaque — just overwrite.
+    if sa == 255 {
+        buf[idx] = src[0];
+        buf[idx + 1] = src[1];
+        buf[idx + 2] = src[2];
+        buf[idx + 3] = 255;
+        return;
+    }
+
+    // General case: integer "source over" compositing.
+    // out_a   = sa + da*(1 - sa/255)  = sa + da*inv_sa/255
+    // out_rgb = (src_rgb*sa + dst_rgb*da_factor) / out_a
+    //   where da_factor = da*inv_sa/255
+    let inv_sa = 255 - sa;
+    let da_factor = (da * inv_sa + 127) / 255;
+    let out_a = sa + da_factor;
+
+    let half = out_a / 2;
+    buf[idx] = ((src[0] as u32 * sa + buf[idx] as u32 * da_factor + half) / out_a) as u8;
+    buf[idx + 1] = ((src[1] as u32 * sa + buf[idx + 1] as u32 * da_factor + half) / out_a) as u8;
+    buf[idx + 2] = ((src[2] as u32 * sa + buf[idx + 2] as u32 * da_factor + half) / out_a) as u8;
+    buf[idx + 3] = out_a as u8;
 }

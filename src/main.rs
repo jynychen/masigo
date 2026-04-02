@@ -102,7 +102,7 @@ fn main() -> Result<()> {
         println!("=== Step 4: 解析 GPS ===");
         let gps_points = match gps::extract_gps_track(&group.front_paths()) {
             Ok(pts) => {
-                println!("{} GPS points", pts.len());
+                println!("{} gnrmc records", pts.len());
                 Some(pts)
             }
             Err(e) => {
@@ -119,7 +119,7 @@ fn main() -> Result<()> {
             }
             println!("=== Step 5: 生成 GPS 軌跡 overlay ===");
             let (fps, duration) = ffprobe::probe_video_info(&front_file)?;
-            println!("影片 {fps:.2} fps, {duration:.1}s");
+            println!("{fps:.2} fps, {duration:.1}s");
             match overlay::render_overlay_video(pts, &cli.output, &group.name, fps, duration) {
                 Ok(path) => {
                     println!("overlay -> {}", path.display());
