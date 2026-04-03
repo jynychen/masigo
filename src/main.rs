@@ -29,6 +29,10 @@ struct Cli {
     /// 略過確認提示，直接開始處理
     #[arg(short, long)]
     yes: bool,
+
+    /// 使用大尺寸 overlay（1920px，預設 480px）
+    #[arg(long)]
+    big: bool,
 }
 
 fn main() -> Result<()> {
@@ -121,7 +125,8 @@ fn main() -> Result<()> {
             println!("=== Step 5: 生成 GPS 軌跡 overlay ===");
             let (fps, duration) = ffprobe::probe_video_info(&front_file)?;
             println!("{fps:.2} fps, {duration:.1}s");
-            match overlay::render_overlay_video(pts, &cli.output, &group.name, fps, duration) {
+            let overlay_size = if cli.big { 1920 } else { 480 };
+            match overlay::render_overlay_video(pts, &cli.output, &group.name, fps, duration, overlay_size) {
                 Ok(path) => {
                     println!("overlay -> {}", path.display());
                     Some(path)

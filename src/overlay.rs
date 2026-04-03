@@ -10,7 +10,6 @@ use anyhow::{Context, Result, bail};
 use crate::gps::GpsPoint;
 use crate::interp::{fill_gaps, upsample_to_fps};
 
-const OVERLAY_SIZE: u32 = 480;
 const PADDING_RATIO: f64 = 0.05;
 /// Duration over which a newly-past segment fades from gray → white.
 const FADE_SECS: f64 = 0.25;
@@ -55,12 +54,12 @@ pub fn render_overlay_video(
     name: &str,
     fps: f64,
     duration_sec: f64,
+    size: u32,
 ) -> Result<PathBuf> {
     if fps <= 0.0 || duration_sec <= 0.0 {
         bail!("fps and duration_sec must be positive (got {fps}, {duration_sec})");
     }
     let output_file = output_dir.join(format!("{}_overlay.mov", name));
-    let size = OVERLAY_SIZE;
 
     // Fill missing GPS entries (gnrmc: None) with cubic spline interpolation.
     let rmc_filled = fill_gaps(rmc_raw);

@@ -33,6 +33,7 @@ cargo run -- -i <輸入目錄> -o <輸出目錄>
 | `-i, --input <PATH>` | 輸入目錄（含 `*_F.MP4` / `*_R.MP4`） | `vid_src` |
 | `-o, --output <PATH>` | 輸出目錄 | `vid_out` |
 | `-y, --yes` | 略過確認提示，直接開始處理 | — |
+| `--big` | 使用大尺寸 GPS overlay（1920px，預設 480px） | — |
 
 ## 處理流程
 
