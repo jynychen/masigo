@@ -126,7 +126,14 @@ fn main() -> Result<()> {
             let (fps, duration) = ffprobe::probe_video_info(&front_file)?;
             println!("{fps:.2} fps, {duration:.1}s");
             let overlay_size = if cli.big { 1920 } else { 480 };
-            match overlay::render_overlay_video(pts, &cli.output, &group.name, fps, duration, overlay_size) {
+            match overlay::render_overlay_video(
+                pts,
+                &cli.output,
+                &group.name,
+                fps,
+                duration,
+                overlay_size,
+            ) {
                 Ok(path) => {
                     println!("overlay -> {}", path.display());
                     Some(path)

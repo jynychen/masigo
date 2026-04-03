@@ -29,7 +29,6 @@ pub struct Gnrmc {
     #[allow(dead_code)]
     pub speed: f64,
     /// True course / heading in degrees.  `f64::NAN` when `!fix`.
-    #[allow(dead_code)]
     pub track: f64,
     /// Accelerometer in g
     /// Z ≈ 1.0 at rest (gravity axis).  Always valid.

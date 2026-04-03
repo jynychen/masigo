@@ -25,16 +25,22 @@ const TRACK_RADIUS_THIN: f32 = 2.0;
 /// Track line half-width for past (already-traversed) segments.
 /// Used as the SDF radius in `aa_coverage` for the thick track.
 const TRACK_RADIUS_THICK: f32 = 3.0;
-/// Current-position dot radius in pixels.
-const DOT_RADIUS: f32 = 8.0;
-/// Current-position dot color in linear light RGB.
-const DOT_COLOR_LIN: [f32; 3] = [1.0, 0.0288, 0.0288]; // sRGB (255,50,50)
+/// Arrow tip protrudes this many pixels forward from the position center.
+const ARROW_FRONT: f32 = 10.0;
+/// Arrow base sits this many pixels behind the position center.
+const ARROW_BACK: f32 = 6.0;
+/// Half-width of the arrow base in pixels.
+const ARROW_HALF_BASE: f32 = 6.0;
+/// White outline thickness around the arrow, in pixels.
+const ARROW_OUTLINE: f32 = 1.5;
+/// Current-position arrow color in linear light RGB.
+const ARROW_COLOR_LIN: [f32; 3] = [1.0, 0.0288, 0.0288]; // sRGB (255,50,50)
 /// Opacity of the future (gray) track.
 const GRAY_A: f32 = 180.0 / 255.0;
 /// Opacity of the fully-past (white) track.
 const WHITE_A: f32 = 230.0 / 255.0;
-/// Linear-light value of the gray track color (sRGB 128).
-const GRAY_LIN: f32 = 0.2158;
+/// Linear-light value of the gray track color (sRGB 192).
+const GRAY_LIN: f32 = 0.5271;
 /// Linear-light value of the white track color (sRGB 255).
 const WHITE_LIN: f32 = 1.0;
 /// Sub-pixel sample offset: pixel (px, py) is sampled at its centre (px+0.5, py+0.5).
@@ -77,19 +83,40 @@ pub fn render_overlay_video(
     let viewport = Viewport::from_track(&rmc_upsampled, size)
         .context("No valid GPS fixes to compute overlay viewport")?;
 
-    // Fps-resolution pixel track from a single per-frame validity source.
-    let track_fps_px: Vec<(f32, f32, bool)> = rmc_upsampled
+    // Fps-resolution pixel track: (x, y, valid, heading_deg).
+    // Heading is circularly interpolated from the raw 1 Hz Gnrmc.track field.
+    let track_fps_px: Vec<(f32, f32, bool, f32)> = rmc_upsampled
         .iter()
         .enumerate()
         .map(|(frame_idx, p)| {
-            let hz1_idx = (frame_idx as f64 / fps).floor() as usize;
+            let t = frame_idx as f64 / fps;
+            let hz1_idx = t.floor() as usize;
             let valid = rmc_raw_valid.get(hz1_idx).copied().unwrap_or(false);
             let (x, y) = if valid {
                 viewport.to_pixel(p.gnrmc.lat, p.gnrmc.lon)
             } else {
                 (0.0, 0.0)
             };
-            (x, y, valid)
+            let i0 = hz1_idx.min(rmc_raw.len().saturating_sub(1));
+            let i1 = (i0 + 1).min(rmc_raw.len().saturating_sub(1));
+            let frac = t - t.floor();
+            let h0 = rmc_raw[i0].gnrmc.track;
+            let h1 = rmc_raw[i1].gnrmc.track;
+            let heading = match (h0.is_nan(), h1.is_nan()) {
+                (false, false) => {
+                    let mut diff = h1 - h0;
+                    if diff > 180.0 {
+                        diff -= 360.0;
+                    } else if diff < -180.0 {
+                        diff += 360.0;
+                    }
+                    ((h0 + frac * diff).rem_euclid(360.0)) as f32
+                }
+                (false, true) => h0 as f32,
+                (true, false) => h1 as f32,
+                (true, true) => 0.0,
+            };
+            (x, y, valid, heading)
         })
         .collect();
 
@@ -283,7 +310,7 @@ impl TrackRaster {
     /// `radius_thin` and `radius_thick` are the two rendering radii used at draw time;
     /// `radius_thick` (the larger) determines which pixels are recorded.
     fn precompute(
-        track: &[(f32, f32, bool)],
+        track: &[(f32, f32, bool, f32)],
         size: u32,
         radius_thin: f32,
         radius_thick: f32,
@@ -298,8 +325,8 @@ impl TrackRaster {
         // Pass 1 (CSR count): count how many segment entries touch each pixel.
         let mut counts = vec![0u32; n];
         for seg_idx in 0..track.len().saturating_sub(1) {
-            let (x0, y0, v0) = track[seg_idx];
-            let (x1, y1, v1) = track[seg_idx + 1];
+            let (x0, y0, v0, _) = track[seg_idx];
+            let (x1, y1, v1, _) = track[seg_idx + 1];
             if !v0 || !v1 {
                 continue;
             }
@@ -338,8 +365,8 @@ impl TrackRaster {
         let mut cursors = vec![0u32; n];
 
         for seg_idx in 0..track.len().saturating_sub(1) {
-            let (x0, y0, v0) = track[seg_idx];
-            let (x1, y1, v1) = track[seg_idx + 1];
+            let (x0, y0, v0, _) = track[seg_idx];
+            let (x1, y1, v1, _) = track[seg_idx + 1];
             if !v0 || !v1 {
                 continue;
             }
@@ -387,7 +414,7 @@ fn render_frame(
     buf: &mut [u8],
     work: &mut [f32],
     raster: &TrackRaster,
-    track_fps_px: &[(f32, f32, bool)],
+    track_fps_px: &[(f32, f32, bool, f32)],
     frame_idx: usize,
     size: u32,
     fade_frames: u32,
@@ -466,9 +493,9 @@ fn render_frame(
         }
     }
 
-    // Layer 2: Current-position dot (Porter-Duff src-over in premultiplied space).
-    if let Some(&(cx, cy, true)) = track_fps_px.get(frame_idx) {
-        draw_aa_circle(work, size, cx, cy, DOT_RADIUS, DOT_COLOR_LIN, 1.0);
+    // Layer 2: Current-position arrow (Porter-Duff src-over in premultiplied space).
+    if let Some(&(cx, cy, true, heading_deg)) = track_fps_px.get(frame_idx) {
+        draw_aa_arrow(work, size, cx, cy, heading_deg, ARROW_COLOR_LIN, 1.0);
     }
 
     // Final pass: premultiplied linear f32 → premultiplied sRGB u8.
@@ -590,35 +617,85 @@ fn composite_color(work: &mut [f32], off: usize, rgb_lin: [f32; 3], alpha: f32) 
     work[off + 3] = alpha + work[off + 3] * inv;
 }
 
-/// Draw an anti-aliased filled circle onto a **premultiplied-alpha linear f32**
+/// Draw an anti-aliased filled arrow onto a **premultiplied-alpha linear f32**
 /// working buffer via Porter-Duff source-over.
-fn draw_aa_circle(
+///
+/// The arrow is an isosceles triangle pointing in `heading_deg` (clockwise from north).
+/// `ARROW_FRONT` pixels protrude forward from `(cx, cy)`; the base is `ARROW_BACK`
+/// pixels behind and `2 × ARROW_HALF_BASE` pixels wide.
+fn draw_aa_arrow(
     work: &mut [f32],
     size: u32,
     cx: f32,
     cy: f32,
-    radius: f32,
+    heading_deg: f32,
     rgb_lin: [f32; 3],
     alpha: f32,
 ) {
-    let outer = radius + 0.5;
-    let s = size as f32;
-    let px_min = (cx - outer).floor().max(0.0) as u32;
-    let px_max = (cx + outer).ceil().min(s - 1.0) as u32;
-    let py_min = (cy - outer).floor().max(0.0) as u32;
-    let py_max = (cy + outer).ceil().min(s - 1.0) as u32;
+    let theta = heading_deg.to_radians();
+    // Forward unit vector in screen space (y-down: north = −y).
+    let fx = theta.sin();
+    let fy = -theta.cos();
+    // Right perpendicular (screen-right when heading north = +x direction).
+    let rx = -fy;
+    let ry = fx;
+
+    // Triangle vertices in CCW winding order (tip → base-right → base-left).
+    // CCW ensures tri_edge_dist returns positive values for interior points.
+    let tip = (cx + fx * ARROW_FRONT, cy + fy * ARROW_FRONT);
+    let base_r = (
+        cx - fx * ARROW_BACK + rx * ARROW_HALF_BASE,
+        cy - fy * ARROW_BACK + ry * ARROW_HALF_BASE,
+    );
+    let base_l = (
+        cx - fx * ARROW_BACK - rx * ARROW_HALF_BASE,
+        cy - fy * ARROW_BACK - ry * ARROW_HALF_BASE,
+    );
+
+    // Bounding box expanded by outline + 0.5 px AA margin.
+    let margin = ARROW_OUTLINE + 1.0;
+    let s = (size - 1) as f32;
+    let px_min = (tip.0.min(base_r.0).min(base_l.0) - margin)
+        .floor()
+        .max(0.0) as u32;
+    let px_max = (tip.0.max(base_r.0).max(base_l.0) + margin).ceil().min(s) as u32;
+    let py_min = (tip.1.min(base_r.1).min(base_l.1) - margin)
+        .floor()
+        .max(0.0) as u32;
+    let py_max = (tip.1.max(base_r.1).max(base_l.1) + margin).ceil().min(s) as u32;
 
     for py in py_min..=py_max {
         for px in px_min..=px_max {
-            let dx = px as f32 + PIXEL_CENTER - cx;
-            let dy = py as f32 + PIXEL_CENTER - cy;
-            let d = (dx * dx + dy * dy).sqrt();
-            let cov = aa_coverage(d, radius);
-            if cov <= 0.0 {
-                continue;
-            }
+            let p = (px as f32 + PIXEL_CENTER, py as f32 + PIXEL_CENTER);
+            // Triangle SDF: positive inside, negative outside.
+            let sdf = tri_edge_dist(p, tip, base_r)
+                .min(tri_edge_dist(p, base_r, base_l))
+                .min(tri_edge_dist(p, base_l, tip));
             let idx = ((py * size + px) * 4) as usize;
-            composite_color(work, idx, rgb_lin, cov * alpha);
+            // White outline: expand the shape by ARROW_OUTLINE pixels.
+            let cov_out = smoothstep(-0.5, 0.5, sdf + ARROW_OUTLINE);
+            if cov_out > 0.0 {
+                composite_color(work, idx, [1.0, 1.0, 1.0], cov_out * alpha);
+            }
+            // Red fill composited on top of the outline.
+            let cov_fill = smoothstep(-0.5, 0.5, sdf);
+            if cov_fill > 0.0 {
+                composite_color(work, idx, rgb_lin, cov_fill * alpha);
+            }
         }
     }
+}
+
+/// Signed distance from point `p` to the left of directed edge `a → b`.
+/// Returns a positive value when `p` is on the left side of the edge,
+/// which is the interior side for a CCW-wound triangle.
+#[inline]
+fn tri_edge_dist(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1e-6 {
+        return 0.0;
+    }
+    ((p.0 - a.0) * (-dy) + (p.1 - a.1) * dx) / len
 }
