@@ -1,6 +1,7 @@
 mod clip;
 mod ffprobe;
 mod gps;
+mod interp;
 mod overlay;
 mod process;
 
