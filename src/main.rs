@@ -9,8 +9,11 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::Parser;
 
 use clip::Direction;
@@ -64,15 +67,9 @@ fn main() -> Result<()> {
         }
     }
 
-    if !cli.yes {
-        print!("\n是否開始處理？(y/n): ");
-        io::stdout().flush()?;
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
-        if answer.trim().to_lowercase() != "y" {
-            println!("已取消");
-            return Ok(());
-        }
+    if !cli.yes && !wait_for_confirmation_interruptible(interrupted.as_ref())? {
+        println!("已取消");
+        return Ok(());
     }
 
     // ── Steps 2–6: 逐組處理 ──
@@ -88,20 +85,20 @@ fn main() -> Result<()> {
         // Step 2: concat Front
         println!("=== Step 2: 串接前鏡頭 ===");
         let front_file = process::concatenate_clips(group, &cli.output, Direction::Front)?;
-        println!("F -> {}", front_file.display());
         if interrupted.load(Ordering::SeqCst) {
             println!("\nUser interrupted, stopping processing.");
             return Ok(());
         }
+        println!("F -> {}", front_file.display());
 
         // Step 3: concat Rear
         println!("=== Step 3: 串接後鏡頭 ===");
         let rear_file = process::concatenate_clips(group, &cli.output, Direction::Rear)?;
-        println!("R -> {}", rear_file.display());
         if interrupted.load(Ordering::SeqCst) {
             println!("\nUser interrupted, stopping processing.");
             return Ok(());
         }
+        println!("R -> {}", rear_file.display());
 
         // Step 4: GPS
         println!("=== Step 4: 解析 GPS ===");
@@ -171,4 +168,30 @@ fn main() -> Result<()> {
 
     println!("\n=== 全部完成！ ===");
     Ok(())
+}
+
+fn wait_for_confirmation_interruptible(interrupted: &AtomicBool) -> Result<bool> {
+    print!("\n是否開始處理？(y/n): ");
+    io::stdout().flush()?;
+
+    let (tx, rx) = mpsc::channel::<io::Result<String>>();
+    thread::spawn(move || {
+        let mut answer = String::new();
+        let result = io::stdin().read_line(&mut answer).map(|_| answer);
+        let _ = tx.send(result);
+    });
+
+    loop {
+        if interrupted.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(answer)) => return Ok(answer.trim().eq_ignore_ascii_case("y")),
+            Ok(Err(e)) => return Err(e.into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!("confirmation input channel disconnected"));
+            }
+        }
+    }
 }

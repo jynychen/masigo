@@ -164,6 +164,8 @@ pub fn render_overlay_video(
     let chunk_size = rayon::current_num_threads() * 2;
     let fade_frames = (FADE_SECS * fps).round().max(1.0) as u32;
 
+    println!("rendering {} frames", total_frames);
+
     let result = (|| -> Result<()> {
         for chunk_start in (0..total_frames).step_by(chunk_size) {
             let chunk_end = (chunk_start + chunk_size).min(total_frames);
@@ -196,8 +198,6 @@ pub fn render_overlay_video(
         }
         Ok(())
     })();
-
-    eprintln!("overlay: {}/{} frames (100%)", total_frames, total_frames);
 
     // Always close stdin and reap the child, even on write error.
     drop(ffmpeg.stdin.take());
