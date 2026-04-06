@@ -8,7 +8,6 @@ use rayon::prelude::*;
 use anyhow::{Context, Result, bail};
 
 use crate::gps::GpsPoint;
-use crate::interp::{fill_gaps, upsample_to_fps};
 
 const PADDING_RATIO: f64 = 0.05;
 /// Duration over which a newly-past segment fades from gray → white.
@@ -53,68 +52,48 @@ thread_local! {
 }
 
 /// Render a transparent GPS track overlay video (RGBA → qtrle .mov).
+///
+/// `rmc_upsampled` – fps-rate GPS points pre-computed by the caller via
+///                  `motion::fill_gaps` + `motion::upsample_to_fps`; one entry
+///                  per output frame.  Each point must carry:
+///                  - `gnrmc.fix`   — per-frame validity flag
+///                  - `gnrmc.track` — circularly-interpolated heading (deg, NaN if unknown)
+///
 /// Returns path to the generated overlay video.
 pub fn render_overlay_video(
-    rmc_raw: &[GpsPoint],
+    track: &[GpsPoint],
     output_dir: &Path,
     name: &str,
     fps: f64,
-    duration_sec: f64,
     size: u32,
 ) -> Result<PathBuf> {
-    if fps <= 0.0 || duration_sec <= 0.0 {
-        bail!("fps and duration_sec must be positive (got {fps}, {duration_sec})");
+    if fps <= 0.0 {
+        bail!("fps must be positive (got {fps})");
+    }
+    if track.is_empty() {
+        bail!("No GPS frames to render");
     }
     let output_file = output_dir.join(format!("{}_overlay.mov", name));
 
-    // Fill missing GPS entries (gnrmc: None) with cubic spline interpolation.
-    let rmc_filled = fill_gaps(rmc_raw);
-
-    // Upsample 1 Hz GPS to match video frame rate for smooth animation.
-    let rmc_upsampled = upsample_to_fps(&rmc_filled, fps, duration_sec);
-    if rmc_upsampled.is_empty() {
-        bail!("No GPS frames to render");
-    }
-
-    // Validity at 1 Hz from the raw (unfilled) track.
-    let rmc_raw_valid: Vec<bool> = rmc_raw.iter().map(|p| p.gnrmc.fix).collect();
-
     // Pre-compute viewport (fixed for entire video, fits entire upsampled track).
-    let viewport = Viewport::from_track(&rmc_upsampled, size)
+    let viewport = Viewport::from_track(track, size)
         .context("No valid GPS fixes to compute overlay viewport")?;
 
     // Fps-resolution pixel track: (x, y, valid, heading_deg).
-    // Heading is circularly interpolated from the raw 1 Hz Gnrmc.track field.
-    let track_fps_px: Vec<(f32, f32, bool, f32)> = rmc_upsampled
+    // fix and track are pre-computed by upsample_to_fps (motion.rs).
+    let track_fps_px: Vec<(f32, f32, bool, f32)> = track
         .iter()
-        .enumerate()
-        .map(|(frame_idx, p)| {
-            let t = frame_idx as f64 / fps;
-            let hz1_idx = t.floor() as usize;
-            let valid = rmc_raw_valid.get(hz1_idx).copied().unwrap_or(false);
+        .map(|p| {
+            let valid = p.gnrmc.fix;
             let (x, y) = if valid {
                 viewport.to_pixel(p.gnrmc.lat, p.gnrmc.lon)
             } else {
                 (0.0, 0.0)
             };
-            let i0 = hz1_idx.min(rmc_raw.len().saturating_sub(1));
-            let i1 = (i0 + 1).min(rmc_raw.len().saturating_sub(1));
-            let frac = t - t.floor();
-            let h0 = rmc_raw[i0].gnrmc.track;
-            let h1 = rmc_raw[i1].gnrmc.track;
-            let heading = match (h0.is_nan(), h1.is_nan()) {
-                (false, false) => {
-                    let mut diff = h1 - h0;
-                    if diff > 180.0 {
-                        diff -= 360.0;
-                    } else if diff < -180.0 {
-                        diff += 360.0;
-                    }
-                    ((h0 + frac * diff).rem_euclid(360.0)) as f32
-                }
-                (false, true) => h0 as f32,
-                (true, false) => h1 as f32,
-                (true, true) => 0.0,
+            let heading = if p.gnrmc.track.is_nan() {
+                0.0
+            } else {
+                p.gnrmc.track as f32
             };
             (x, y, valid, heading)
         })
@@ -156,7 +135,7 @@ pub fn render_overlay_video(
         .context("Failed to spawn ffmpeg for overlay")?;
 
     let stdin = ffmpeg.stdin.as_mut().context("No ffmpeg stdin")?;
-    let total_frames = rmc_upsampled.len();
+    let total_frames = track.len();
     let frame_len = (size * size * 4) as usize;
 
     // Render frames in parallel chunks, write each chunk sequentially to ffmpeg.

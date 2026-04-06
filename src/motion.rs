@@ -179,12 +179,12 @@ pub(crate) fn fill_gaps(track: &[GpsPoint]) -> Vec<GpsPoint> {
 
 // ── GPS upsampling ────────────────────────────────────────────────────────────
 
-/// Unpack lat/lon and validity flag from a `GpsPoint`.
-fn unpack_coords(p: &GpsPoint) -> (f64, f64, bool) {
-    (p.gnrmc.lat, p.gnrmc.lon, p.gnrmc.fix)
-}
-
-/// Upsample 1 Hz GPS points to `target_fps` via cubic spline interpolation.
+/// Upsample 1 Hz GPS points to `target_fps`.
+///
+/// Each output frame carries:
+/// - `gnrmc.lat/lon` — position via cubic spline (≥ 2 valid points) or floor-point fallback
+/// - `gnrmc.fix`     — validity from the floor 1 Hz source point (false for gap-filled seconds)
+/// - `gnrmc.track`   — heading circularly interpolated between floor and ceil 1 Hz points
 pub(crate) fn upsample_to_fps(
     points: &[GpsPoint],
     target_fps: f64,
@@ -228,31 +228,66 @@ pub(crate) fn upsample_to_fps(
     for frame_idx in 0..total_frames {
         let t = frame_idx as f64 / target_fps;
 
-        // Find the floor 1 Hz point for metadata (file_path).
-        let floor_pt = if t >= last_t {
-            points.last().unwrap()
+        // Find the floor 1 Hz index for metadata, validity, and heading.
+        let floor_idx = if t >= last_t {
+            points.len() - 1
         } else {
             let pos = point_secs.partition_point(|&s| s <= t);
-            &points[pos.saturating_sub(1)]
+            pos.saturating_sub(1)
+        };
+        let floor_pt = &points[floor_idx];
+
+        // Per-second validity from the source track (fix: false for gap-filled seconds).
+        let fix = floor_pt.gnrmc.fix;
+
+        // Evaluate position: spline if available, else floor-point coords (NaN if invalid).
+        let (lat, lon) = if let Some((ref lat_sp, ref lon_sp)) = splines {
+            (lat_sp.eval(t), lon_sp.eval(t))
+        } else if fix {
+            (floor_pt.gnrmc.lat, floor_pt.gnrmc.lon)
+        } else {
+            (f64::NAN, f64::NAN)
         };
 
-        // Evaluate position via spline (or fallback to single-point / unpack).
-        let (lat, lon, valid) = if let Some((ref lat_sp, ref lon_sp)) = splines {
-            (lat_sp.eval(t), lon_sp.eval(t), true)
+        // Circularly interpolate heading between the floor and ceil 1 Hz points.
+        let ceil_idx = (floor_idx + 1).min(points.len() - 1);
+        let frac = if ceil_idx > floor_idx {
+            let dt = point_secs[ceil_idx] - point_secs[floor_idx];
+            if dt > 0.0 {
+                ((t - point_secs[floor_idx]) / dt).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
         } else {
-            unpack_coords(floor_pt)
+            0.0
+        };
+        let h0 = points[floor_idx].gnrmc.track;
+        let h1 = points[ceil_idx].gnrmc.track;
+        let track = match (h0.is_nan(), h1.is_nan()) {
+            (false, false) => {
+                let mut diff = h1 - h0;
+                if diff > 180.0 {
+                    diff -= 360.0;
+                } else if diff < -180.0 {
+                    diff += 360.0;
+                }
+                (h0 + frac * diff).rem_euclid(360.0)
+            }
+            (false, true) => h0,
+            (true, false) => h1,
+            (true, true) => f64::NAN,
         };
 
         let time = base_time
             .map(|bt| bt + Duration::from_secs_f64(t))
             .unwrap_or(SystemTime::UNIX_EPOCH + Duration::from_secs_f64(t));
         let gnrmc = Gnrmc {
-            fix: valid,
+            fix,
             time,
-            lat: if valid { lat } else { f64::NAN },
-            lon: if valid { lon } else { f64::NAN },
+            lat: if fix { lat } else { f64::NAN },
+            lon: if fix { lon } else { f64::NAN },
             speed: f64::NAN,
-            track: f64::NAN,
+            track,
             accel_z: f64::NAN,
             accel_x: f64::NAN,
             accel_y: f64::NAN,

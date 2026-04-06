@@ -2,7 +2,7 @@ mod clip;
 mod ffmpeg;
 mod ffprobe;
 mod gps;
-mod interp;
+mod motion;
 mod overlay;
 
 use std::io::{self, Write};
@@ -100,12 +100,15 @@ fn main() -> Result<()> {
         }
         println!("R -> {}", rear_file.display());
 
-        // Step 4: GPS
+        // Step 4: GPS — parse, fill gaps, upsample to video frame rate.
         println!("=== Step 4: 解析 GPS ===");
-        let gps_points = match gps::extract_gps_track(&group.front_paths()) {
+        let (fps, duration) = ffprobe::probe_video_info(&front_file)?;
+        println!("{fps:.2} fps, {duration:.1}s");
+        let rmc_upsampled = match gps::extract_gps_track(&group.front_paths()) {
             Ok(pts) => {
                 println!("{} gnrmc records", pts.len());
-                Some(pts)
+                let rmc_filled = motion::fill_gaps(&pts);
+                Some(motion::upsample_to_fps(&rmc_filled, fps, duration))
             }
             Err(e) => {
                 println!("GPS parsing failed: {e}");
@@ -114,23 +117,15 @@ fn main() -> Result<()> {
         };
 
         // Step 5: overlay
-        let overlay_file = if let Some(ref pts) = gps_points {
+        let overlay_file = if let Some(ref track) = rmc_upsampled {
             if interrupted.load(Ordering::SeqCst) {
                 println!("\nUser interrupted, stopping processing.");
                 return Ok(());
             }
             println!("=== Step 5: 生成 GPS 軌跡 overlay ===");
-            let (fps, duration) = ffprobe::probe_video_info(&front_file)?;
-            println!("{fps:.2} fps, {duration:.1}s");
             let overlay_size = if cli.big { 1920 } else { 480 };
-            match overlay::render_overlay_video(
-                pts,
-                &cli.output,
-                &group.name,
-                fps,
-                duration,
-                overlay_size,
-            ) {
+            match overlay::render_overlay_video(track, &cli.output, &group.name, fps, overlay_size)
+            {
                 Ok(path) => {
                     println!("overlay -> {}", path.display());
                     Some(path)
