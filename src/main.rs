@@ -1,9 +1,9 @@
 mod clip;
+mod ffmpeg;
 mod ffprobe;
 mod gps;
 mod interp;
 mod overlay;
-mod process;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -84,7 +84,7 @@ fn main() -> Result<()> {
 
         // Step 2: concat Front
         println!("=== Step 2: 串接前鏡頭 ===");
-        let front_file = process::concatenate_clips(group, &cli.output, Direction::Front)?;
+        let front_file = ffmpeg::concatenate_clips(group, &cli.output, Direction::Front)?;
         if interrupted.load(Ordering::SeqCst) {
             println!("\nUser interrupted, stopping processing.");
             return Ok(());
@@ -93,7 +93,7 @@ fn main() -> Result<()> {
 
         // Step 3: concat Rear
         println!("=== Step 3: 串接後鏡頭 ===");
-        let rear_file = process::concatenate_clips(group, &cli.output, Direction::Rear)?;
+        let rear_file = ffmpeg::concatenate_clips(group, &cli.output, Direction::Rear)?;
         if interrupted.load(Ordering::SeqCst) {
             println!("\nUser interrupted, stopping processing.");
             return Ok(());
@@ -151,7 +151,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         println!("=== Step 6: PIP 合成 ===");
-        let final_file = process::compose_pip(
+        let final_file = ffmpeg::compose_pip(
             &front_file,
             &rear_file,
             overlay_file.as_deref(),
