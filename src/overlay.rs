@@ -26,8 +26,11 @@ const TRACK_RADIUS_THIN: f32 = 2.0;
 const TRACK_RADIUS_THICK: f32 = 3.0;
 /// Arrow tip protrudes this many pixels forward from the position center.
 const ARROW_FRONT: f32 = 10.0;
-/// Arrow base sits this many pixels behind the position center.
+/// Arrow base corners sit this many pixels behind the position center.
 const ARROW_BACK: f32 = 6.0;
+/// The notch at the center of the arrow base sits this many pixels behind center.
+/// Must be less than `ARROW_BACK` to create an inward indent.
+const ARROW_NOTCH_BACK: f32 = 3.0;
 /// Half-width of the arrow base in pixels.
 const ARROW_HALF_BASE: f32 = 6.0;
 /// White outline thickness around the arrow, in pixels.
@@ -39,10 +42,10 @@ const PIXEL_CENTER: f32 = 0.5;
 
 // Color specification is centralized here and expressed in linear-light values.
 const TRACK_FUTURE: ColorLinA =
-    ColorLinA::new([192.0 / 255.0, 192.0 / 255.0, 192.0 / 255.0], 180.0 / 255.0);
-const TRACK_PAST: ColorLinA = ColorLinA::new([1.0, 1.0, 1.0], 230.0 / 255.0);
+    ColorLinA::new([192.0 / 255.0, 192.0 / 255.0, 192.0 / 255.0], 130.0 / 255.0);
+const TRACK_PAST: ColorLinA = ColorLinA::new([1.0, 1.0, 1.0], 200.0 / 255.0);
 const ARROW_FILL: ColorLinA = ColorLinA::new([1.0, 50.0 / 255.0, 50.0 / 255.0], 1.0);
-const ARROW_STROKE: ColorLinA = ColorLinA::new([1.0, 1.0, 1.0], 1.0);
+const ARROW_STROKE: ColorLinA =  ColorLinA::new([192.0 / 255.0, 192.0 / 255.0, 192.0 / 255.0], 1.0);
 
 #[derive(Copy, Clone)]
 struct ColorLinA {
@@ -649,8 +652,8 @@ fn draw_aa_arrow(
     let rx = -fy;
     let ry = fx;
 
-    // Triangle vertices in CCW winding order (tip → base-right → base-left).
-    // CCW ensures tri_edge_dist returns positive values for interior points.
+    // Arrow vertices — classic arrowhead shape with a notched base.
+    // All CCW winding: tri_edge_dist returns positive values for interior points.
     let tip = (cx + fx * ARROW_FRONT, cy + fy * ARROW_FRONT);
     let base_r = (
         cx - fx * ARROW_BACK + rx * ARROW_HALF_BASE,
@@ -660,6 +663,8 @@ fn draw_aa_arrow(
         cx - fx * ARROW_BACK - rx * ARROW_HALF_BASE,
         cy - fy * ARROW_BACK - ry * ARROW_HALF_BASE,
     );
+    // Notch: center of the base pulled forward to create an inward indent.
+    let notch = (cx - fx * ARROW_NOTCH_BACK, cy - fy * ARROW_NOTCH_BACK);
 
     // Bounding box expanded by outline + 0.5 px AA margin.
     let margin = ARROW_OUTLINE + 1.0;
@@ -676,10 +681,17 @@ fn draw_aa_arrow(
     for py in py_min..=py_max {
         for px in px_min..=px_max {
             let p = (px as f32 + PIXEL_CENTER, py as f32 + PIXEL_CENTER);
-            // Triangle SDF: positive inside, negative outside.
-            let sdf = tri_edge_dist(p, tip, base_r)
-                .min(tri_edge_dist(p, base_r, base_l))
+            // Classic arrowhead = union of two CCW triangles:
+            //   left wing:  tip → notch → base_l
+            //   right wing: tip → base_r → notch
+            // Union SDF = max of the two triangle SDFs.
+            let sdf_left = tri_edge_dist(p, tip, notch)
+                .min(tri_edge_dist(p, notch, base_l))
                 .min(tri_edge_dist(p, base_l, tip));
+            let sdf_right = tri_edge_dist(p, tip, base_r)
+                .min(tri_edge_dist(p, base_r, notch))
+                .min(tri_edge_dist(p, notch, tip));
+            let sdf = sdf_left.max(sdf_right);
             let idx = ((py * size + px) * 4) as usize;
             // White outline: expand the shape by ARROW_OUTLINE pixels.
             let cov_out = smoothstep(-0.5, 0.5, sdf + ARROW_OUTLINE);
