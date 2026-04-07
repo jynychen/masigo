@@ -13,29 +13,42 @@ const FREEGPS_MAGIC: &[u8] = b"freeGPS ";
 /// Bytes needed to cover all binary header fields (through accel_y at 0x64–0x67).
 const HEADER_LEN: usize = 0x68;
 
-// ── freeGPS sample header field offsets ──────────────────────────────────────
+// ── freeGPS `free` atom layout ────────────────────────────────────────────────
 //
-// All fields are little-endian.  Layout (offsets in hex):
-//   0x00  u32    block size (always 0x4000)
-//   0x04  8B     magic "freeGPS "
-//   0x0c  u32    (reserved)
-//   0x10  u32    UTC hour
-//   0x14  u32    UTC minute
-//   0x18  u32    UTC second
-//   0x1c  u8     GPS status  'A' = valid fix  'V' = void
-//   0x20  f64    latitude  in NMEA ddmm.mmmmm
-//   0x28  u8     N / S
-//   0x30  f64    longitude in NMEA dddmm.mmmmm
-//   0x38  u8     E / W
-//   0x40  f64    speed over ground (knots)
-//   0x48  f64    true course / heading (degrees)
-//   0x50  u32    year  (2-digit, e.g. 26 → 2026)
-//   0x54  u32    month
-//   0x58  u32    day
-//   0x5c  i32    accelerometer Z  (÷ 1000 → g; ~1.0 at rest)
-//   0x60  i32    accelerometer X  (÷ 1000 → g)
-//   0x64  i32    accelerometer Y  (÷ 1000 → g)
-//   0x68  …      ' ' + NMEA sentence ($GNRMC / $GPRMC)
+// Each GPS sample occupies one ISO MP4 `free` atom (0x4000 = 16 384 B).
+// One atom per second; the atom is null-padded after the NMEA sentence.
+//
+//   [0x0000 – 0x0067]  binary header  (parsed below)
+//   [0x0068 – ~0x00B7] NMEA sentence: ' ' + $GNRMC/GPRMC + "\r\n" + '\0'
+//                      duplicates the binary fields; only unique data is the
+//                      sub-second timestamp (e.g. "072400.219")
+//                      bytes after '\0' may contain stale data from a previous
+//                      write cycle (firmware does not zero the remainder)
+//   [rest]             mostly 0x00 padding to fill the 0x4000-byte atom
+//
+// Binary header field offsets (all LE except 0x00):
+//   0x00  u32 BE  atom size (0x4000 = 16 384 B on this device)
+//   0x04  8B      magic "freeGPS "
+//   0x0c  u32     firmware format tag (0x3F0 on NT96xxx; reserved/opaque)
+//   0x10  u32     UTC hour
+//   0x14  u32     UTC minute
+//   0x18  u32     UTC second
+//   0x1c  u8      GPS status  'A' = valid fix  'V' = void
+//   0x1d  3B      null padding (status stored in 4-byte aligned slot)
+//   0x20  f64     latitude  in NMEA ddmm.mmmmm  (0.0 when void)
+//   0x28  u8      N / S  ('0' when void)
+//   0x29  7B      null padding (hemisphere stored in 8-byte aligned slot)
+//   0x30  f64     longitude in NMEA dddmm.mmmmm  (0.0 when void)
+//   0x38  u8      E / W  ('0' when void)
+//   0x39  7B      null padding (hemisphere stored in 8-byte aligned slot)
+//   0x40  f64     speed over ground (knots)
+//   0x48  f64     true course / heading (degrees)
+//   0x50  u32     year  (2-digit, e.g. 26 → 2026)
+//   0x54  u32     month
+//   0x58  u32     day
+//   0x5c  i32     accelerometer Z  (÷ 1000 → g; ~1.0 at rest)
+//   0x60  i32     accelerometer X  (÷ 1000 → g)
+//   0x64  i32     accelerometer Y  (÷ 1000 → g)
 const HDR_HOUR: usize = 0x10;
 const HDR_MINUTE: usize = 0x14;
 const HDR_SECOND: usize = 0x18;
