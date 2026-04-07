@@ -2,7 +2,6 @@ mod clip;
 mod ffmpeg;
 mod ffprobe;
 mod gps;
-mod motion;
 mod overlay;
 
 use std::io::{self, Write};
@@ -100,15 +99,14 @@ fn main() -> Result<()> {
         }
         println!("R -> {}", rear_file.display());
 
-        // Step 4: GPS — parse, fill gaps, upsample to video frame rate.
+        // Step 4: GPS — parse and upsample to video frame rate.
         println!("=== Step 4: 解析 GPS ===");
         let (fps, duration) = ffprobe::probe_video_info(&front_file)?;
         println!("{fps:.2} fps, {duration:.1}s");
-        let rmc_upsampled = match gps::extract_gps_track(&group.front_paths()) {
-            Ok(pts) => {
-                println!("{} gnrmc records", pts.len());
-                let rmc_filled = motion::fill_gaps(&pts);
-                Some(motion::upsample_to_fps(&rmc_filled, fps, duration))
+        let gps_smoothed = match gps::extract_smoothed_to_fps(&group.front_paths(), fps, duration) {
+            Ok((track, record_count)) => {
+                println!("{record_count} gnrmc records");
+                Some(track)
             }
             Err(e) => {
                 println!("GPS parsing failed: {e}");
@@ -117,7 +115,7 @@ fn main() -> Result<()> {
         };
 
         // Step 5: overlay
-        let overlay_file = if let Some(ref track) = rmc_upsampled {
+        let overlay_file = if let Some(ref track) = gps_smoothed {
             if interrupted.load(Ordering::SeqCst) {
                 println!("\nUser interrupted, stopping processing.");
                 return Ok(());

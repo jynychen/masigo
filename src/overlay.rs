@@ -7,7 +7,7 @@ use rayon::prelude::*;
 
 use anyhow::{Context, Result, bail};
 
-use crate::gps::GpsPoint;
+use crate::gps::{GpsPoint, PositionSource};
 
 const PADDING_RATIO: f64 = 0.05;
 /// Duration over which a newly-past segment fades from gray → white.
@@ -32,32 +32,70 @@ const ARROW_BACK: f32 = 6.0;
 const ARROW_HALF_BASE: f32 = 6.0;
 /// White outline thickness around the arrow, in pixels.
 const ARROW_OUTLINE: f32 = 1.5;
-/// Current-position arrow color in linear light RGB.
-const ARROW_COLOR_LIN: [f32; 3] = [1.0, 0.0288, 0.0288]; // sRGB (255,50,50)
-/// Opacity of the future (gray) track.
-const GRAY_A: f32 = 180.0 / 255.0;
-/// Opacity of the fully-past (white) track.
-const WHITE_A: f32 = 230.0 / 255.0;
-/// Linear-light value of the gray track color (sRGB 192).
-const GRAY_LIN: f32 = 0.5271;
-/// Linear-light value of the white track color (sRGB 255).
-const WHITE_LIN: f32 = 1.0;
+
 /// Sub-pixel sample offset: pixel (px, py) is sampled at its centre (px+0.5, py+0.5).
 /// Follows the OpenGL/Vulkan convention where pixel [i] covers [i, i+1).
 const PIXEL_CENTER: f32 = 0.5;
 
+// Color specification is centralized here and expressed in linear-light values.
+const TRACK_FUTURE: ColorLinA =
+    ColorLinA::new([192.0 / 255.0, 192.0 / 255.0, 192.0 / 255.0], 180.0 / 255.0);
+const TRACK_PAST: ColorLinA = ColorLinA::new([1.0, 1.0, 1.0], 230.0 / 255.0);
+const ARROW_FILL: ColorLinA = ColorLinA::new([1.0, 50.0 / 255.0, 50.0 / 255.0], 1.0);
+const ARROW_STROKE: ColorLinA = ColorLinA::new([1.0, 1.0, 1.0], 1.0);
+
+#[derive(Copy, Clone)]
+struct ColorLinA {
+    rgb: [f32; 3],
+    alpha: f32,
+}
+
+impl ColorLinA {
+    const fn new(rgb: [f32; 3], alpha: f32) -> Self {
+        Self { rgb, alpha }
+    }
+
+    #[inline]
+    fn lerp(self, other: Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        Self {
+            rgb: [
+                self.rgb[0] + t * (other.rgb[0] - self.rgb[0]),
+                self.rgb[1] + t * (other.rgb[1] - self.rgb[1]),
+                self.rgb[2] + t * (other.rgb[2] - self.rgb[2]),
+            ],
+            alpha: self.alpha + t * (other.alpha - self.alpha),
+        }
+    }
+}
+
+/// Per-frame GPS track data projected into pixel space.
+struct PixelTrackFrame {
+    /// Pixel x coordinate; `NAN` when no valid position.
+    x: f32,
+    /// Pixel y coordinate; `NAN` when no valid position.
+    y: f32,
+    /// Heading in degrees (circularly interpolated); `NAN` when unknown.
+    heading: f32,
+    /// `true` when position is gap-filled (selects white arrow instead of red).
+    is_interpolated: bool,
+}
+
 thread_local! {
-    /// Per-thread scratch buffer reused across frames to avoid per-frame heap allocation.
+    /// Per-thread f32 scratch buffer reused across frames to avoid per-frame heap allocation.
+    ///
+    /// `RefCell` is required by the thread-local API for interior mutability.
+    /// It is safe here because rayon tasks never run concurrently on the same thread,
+    /// so `borrow_mut()` is never called from two closures on the same thread at once.
     static WORK_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Render a transparent GPS track overlay video (RGBA → qtrle .mov).
 ///
-/// `rmc_upsampled` – fps-rate GPS points pre-computed by the caller via
-///                  `motion::fill_gaps` + `motion::upsample_to_fps`; one entry
-///                  per output frame.  Each point must carry:
-///                  - `gnrmc.fix`   — per-frame validity flag
-///                  - `gnrmc.track` — circularly-interpolated heading (deg, NaN if unknown)
+/// `track` – fps-rate GPS points pre-computed by the caller via
+///           `gps::extract_and_upsample`; one entry per output frame.
+///           Each point carries `position` (PositionSource) and
+///           `gnrmc.track` (circularly-interpolated heading in degrees).
 ///
 /// Returns path to the generated overlay video.
 pub fn render_overlay_video(
@@ -79,23 +117,20 @@ pub fn render_overlay_video(
     let viewport = Viewport::from_track(track, size)
         .context("No valid GPS fixes to compute overlay viewport")?;
 
-    // Fps-resolution pixel track: (x, y, valid, heading_deg).
-    // fix and track are pre-computed by upsample_to_fps (motion.rs).
-    let track_fps_px: Vec<(f32, f32, bool, f32)> = track
+    let track_fps_px: Vec<PixelTrackFrame> = track
         .iter()
         .map(|p| {
-            let valid = p.gnrmc.fix;
-            let (x, y) = if valid {
+            let (x, y) = if p.position_valid() {
                 viewport.to_pixel(p.gnrmc.lat, p.gnrmc.lon)
             } else {
-                (0.0, 0.0)
+                (f32::NAN, f32::NAN)
             };
-            let heading = if p.gnrmc.track.is_nan() {
-                0.0
-            } else {
-                p.gnrmc.track as f32
-            };
-            (x, y, valid, heading)
+            PixelTrackFrame {
+                x,
+                y,
+                heading: p.gnrmc.track as f32,
+                is_interpolated: p.position == PositionSource::Interpolated,
+            }
         })
         .collect();
 
@@ -205,13 +240,15 @@ struct Viewport {
 
 impl Viewport {
     fn from_track(track: &[GpsPoint], size: u32) -> Option<Self> {
-        let mut fixed = track
+        // Use all drawable positions (hardware fixes + interpolated) so that
+        // spline-filled gaps don't extend outside the visible viewport.
+        let mut valid = track
             .iter()
-            .filter(|p| p.gnrmc.fix)
+            .filter(|p| p.position_valid())
             .map(|p| (p.gnrmc.lat, p.gnrmc.lon));
 
-        let (first_lat, first_lon) = fixed.next()?;
-        let (min_lat, max_lat, min_lon, max_lon) = fixed.fold(
+        let (first_lat, first_lon) = valid.next()?;
+        let (min_lat, max_lat, min_lon, max_lon) = valid.fold(
             (first_lat, first_lat, first_lon, first_lon),
             |(mn_la, mx_la, mn_lo, mx_lo), (lat, lon)| {
                 (
@@ -289,7 +326,7 @@ impl TrackRaster {
     /// `radius_thin` and `radius_thick` are the two rendering radii used at draw time;
     /// `radius_thick` (the larger) determines which pixels are recorded.
     fn precompute(
-        track: &[(f32, f32, bool, f32)],
+        track: &[PixelTrackFrame],
         size: u32,
         radius_thin: f32,
         radius_thick: f32,
@@ -304,9 +341,9 @@ impl TrackRaster {
         // Pass 1 (CSR count): count how many segment entries touch each pixel.
         let mut counts = vec![0u32; n];
         for seg_idx in 0..track.len().saturating_sub(1) {
-            let (x0, y0, v0, _) = track[seg_idx];
-            let (x1, y1, v1, _) = track[seg_idx + 1];
-            if !v0 || !v1 {
+            let (x0, y0) = (track[seg_idx].x, track[seg_idx].y);
+            let (x1, y1) = (track[seg_idx + 1].x, track[seg_idx + 1].y);
+            if !x0.is_finite() || !x1.is_finite() {
                 continue;
             }
             let (px_min, px_max, py_min, py_max) =
@@ -344,9 +381,9 @@ impl TrackRaster {
         let mut cursors = vec![0u32; n];
 
         for seg_idx in 0..track.len().saturating_sub(1) {
-            let (x0, y0, v0, _) = track[seg_idx];
-            let (x1, y1, v1, _) = track[seg_idx + 1];
-            if !v0 || !v1 {
+            let (x0, y0) = (track[seg_idx].x, track[seg_idx].y);
+            let (x1, y1) = (track[seg_idx + 1].x, track[seg_idx + 1].y);
+            if !x0.is_finite() || !x1.is_finite() {
                 continue;
             }
             let (px_min, px_max, py_min, py_max) =
@@ -393,7 +430,7 @@ fn render_frame(
     buf: &mut [u8],
     work: &mut [f32],
     raster: &TrackRaster,
-    track_fps_px: &[(f32, f32, bool, f32)],
+    track_fps_px: &[PixelTrackFrame],
     frame_idx: usize,
     size: u32,
     fade_frames: u32,
@@ -429,7 +466,7 @@ fn render_frame(
             }
         }
         if future_cov > 0.0 {
-            composite_gray(work, off, GRAY_LIN, future_cov * GRAY_A);
+            composite_color(work, off, TRACK_FUTURE.rgb, future_cov * TRACK_FUTURE.alpha);
         }
 
         // Sub-layer 1b: Past track (fully faded, uniform white).
@@ -446,7 +483,7 @@ fn render_frame(
             }
         }
         if past_full_cov > 0.0 {
-            composite_gray(work, off, WHITE_LIN, past_full_cov * WHITE_A);
+            composite_color(work, off, TRACK_PAST.rgb, past_full_cov * TRACK_PAST.alpha);
         }
 
         // Sub-layer 1c: Still-fading segments (within FADE_SECS of cursor).
@@ -465,16 +502,23 @@ fn render_frame(
             let t = age as f32 / fade_frames as f32;
             let ct = aa_coverage(d, TRACK_RADIUS_THICK);
             let cn = aa_coverage(d, TRACK_RADIUS_THIN);
-            let c_lin = GRAY_LIN + t * (WHITE_LIN - GRAY_LIN);
             let cov = cn + t * (ct - cn);
-            let a = cov * (GRAY_A + t * (WHITE_A - GRAY_A));
-            composite_gray(work, off, c_lin, a);
+            let color = TRACK_FUTURE.lerp(TRACK_PAST, t);
+            composite_color(work, off, color.rgb, cov * color.alpha);
         }
     }
 
     // Layer 2: Current-position arrow (Porter-Duff src-over in premultiplied space).
-    if let Some(&(cx, cy, true, heading_deg)) = track_fps_px.get(frame_idx) {
-        draw_aa_arrow(work, size, cx, cy, heading_deg, ARROW_COLOR_LIN, 1.0);
+    // Arrow is red for real GPS fixes, white for gap-filled interpolated positions.
+    if let Some(p) = track_fps_px.get(frame_idx)
+        && p.x.is_finite()
+    {
+        let fill = if p.is_interpolated {
+            ARROW_STROKE
+        } else {
+            ARROW_FILL
+        };
+        draw_aa_arrow(work, size, p.x, p.y, p.heading, fill, 1.0);
     }
 
     // Final pass: premultiplied linear f32 → premultiplied sRGB u8.
@@ -571,20 +615,6 @@ fn linear_to_srgb(c: f32) -> f32 {
     }
 }
 
-/// Porter-Duff src-over for a grayscale source onto a premultiplied-alpha linear f32 buffer.
-/// Formula: C_out = C_src·α + C_dst·(1−α),  α_out = α + α_dst·(1−α).
-/// `c_lin` is the straight linear-light luminance (identical for R, G, B), `alpha` is the
-/// source opacity.  Premultiplication is performed internally.
-#[inline]
-fn composite_gray(work: &mut [f32], off: usize, c_lin: f32, alpha: f32) {
-    let pm = c_lin * alpha;
-    let inv = 1.0 - alpha;
-    work[off] = pm + work[off] * inv;
-    work[off + 1] = pm + work[off + 1] * inv;
-    work[off + 2] = pm + work[off + 2] * inv;
-    work[off + 3] = alpha + work[off + 3] * inv;
-}
-
 /// Porter-Duff src-over for a colored source onto a premultiplied-alpha linear f32 buffer.
 /// `rgb_lin` is the straight linear-light RGB, `alpha` is the source opacity.
 #[inline]
@@ -608,7 +638,7 @@ fn draw_aa_arrow(
     cx: f32,
     cy: f32,
     heading_deg: f32,
-    rgb_lin: [f32; 3],
+    fill: ColorLinA,
     alpha: f32,
 ) {
     let theta = heading_deg.to_radians();
@@ -654,12 +684,17 @@ fn draw_aa_arrow(
             // White outline: expand the shape by ARROW_OUTLINE pixels.
             let cov_out = smoothstep(-0.5, 0.5, sdf + ARROW_OUTLINE);
             if cov_out > 0.0 {
-                composite_color(work, idx, [1.0, 1.0, 1.0], cov_out * alpha);
+                composite_color(
+                    work,
+                    idx,
+                    ARROW_STROKE.rgb,
+                    cov_out * ARROW_STROKE.alpha * alpha,
+                );
             }
             // Red fill composited on top of the outline.
             let cov_fill = smoothstep(-0.5, 0.5, sdf);
             if cov_fill > 0.0 {
-                composite_color(work, idx, rgb_lin, cov_fill * alpha);
+                composite_color(work, idx, fill.rgb, cov_fill * fill.alpha * alpha);
             }
         }
     }
