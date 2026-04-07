@@ -45,7 +45,7 @@ const TRACK_FUTURE: ColorLinA =
     ColorLinA::new([192.0 / 255.0, 192.0 / 255.0, 192.0 / 255.0], 130.0 / 255.0);
 const TRACK_PAST: ColorLinA = ColorLinA::new([1.0, 1.0, 1.0], 200.0 / 255.0);
 const ARROW_FILL: ColorLinA = ColorLinA::new([1.0, 50.0 / 255.0, 50.0 / 255.0], 1.0);
-const ARROW_STROKE: ColorLinA =  ColorLinA::new([192.0 / 255.0, 192.0 / 255.0, 192.0 / 255.0], 1.0);
+const ARROW_STROKE: ColorLinA = ColorLinA::new([192.0 / 255.0, 192.0 / 255.0, 192.0 / 255.0], 1.0);
 
 #[derive(Copy, Clone)]
 struct ColorLinA {
@@ -56,19 +56,6 @@ struct ColorLinA {
 impl ColorLinA {
     const fn new(rgb: [f32; 3], alpha: f32) -> Self {
         Self { rgb, alpha }
-    }
-
-    #[inline]
-    fn lerp(self, other: Self, t: f32) -> Self {
-        let t = t.clamp(0.0, 1.0);
-        Self {
-            rgb: [
-                self.rgb[0] + t * (other.rgb[0] - self.rgb[0]),
-                self.rgb[1] + t * (other.rgb[1] - self.rgb[1]),
-                self.rgb[2] + t * (other.rgb[2] - self.rgb[2]),
-            ],
-            alpha: self.alpha + t * (other.alpha - self.alpha),
-        }
     }
 }
 
@@ -487,27 +474,6 @@ fn render_frame(
         }
         if past_full_cov > 0.0 {
             composite_color(work, off, TRACK_PAST.rgb, past_full_cov * TRACK_PAST.alpha);
-        }
-
-        // Sub-layer 1c: Still-fading segments (within FADE_SECS of cursor).
-        // Each segment has a unique interpolated color/radius (gray→white,
-        // thin→thick), so coverage-union cannot be used; Porter-Duff src-over
-        // is applied per segment.  Mild opacity build-up at self-crossings
-        // is accepted — the fade window is short (FADE_SECS) and subtle.
-        for &(seg, d) in &raster.entries[start..end] {
-            if seg >= cur_seg {
-                continue;
-            }
-            let age = cur_seg - seg;
-            if age >= fade_frames {
-                continue;
-            }
-            let t = age as f32 / fade_frames as f32;
-            let ct = aa_coverage(d, TRACK_RADIUS_THICK);
-            let cn = aa_coverage(d, TRACK_RADIUS_THIN);
-            let cov = cn + t * (ct - cn);
-            let color = TRACK_FUTURE.lerp(TRACK_PAST, t);
-            composite_color(work, off, color.rgb, cov * color.alpha);
         }
     }
 
