@@ -39,6 +39,10 @@ struct Cli {
     /// 解析 GPS 並生成軌跡 overlay（未設定則略過步驟 4、5）
     #[arg(long)]
     gps: bool,
+
+    /// 保留中間檔案（串接的 _F.mp4 / _R.mp4），預設完成後刪除
+    #[arg(long)]
+    keep: bool,
 }
 
 fn main() -> Result<()> {
@@ -165,6 +169,13 @@ fn main() -> Result<()> {
         // Clean up intermediate overlay video
         if let Some(ref ov) = overlay_file {
             let _ = std::fs::remove_file(ov);
+        }
+
+        // Clean up intermediate _F / _R files unless --keep is set
+        if !cli.keep {
+            let _ = std::fs::remove_file(&front_file);
+            let _ = std::fs::remove_file(&rear_file);
+            println!("cleaned up intermediate F/R files");
         }
     }
 
