@@ -35,6 +35,10 @@ struct Cli {
     /// 使用大尺寸 overlay（1920px，預設 480px）
     #[arg(long)]
     big: bool,
+
+    /// 解析 GPS 並生成軌跡 overlay（未設定則略過步驟 4、5）
+    #[arg(long)]
+    gps: bool,
 }
 
 fn main() -> Result<()> {
@@ -100,41 +104,46 @@ fn main() -> Result<()> {
         println!("R -> {}", rear_file.display());
 
         // Step 4: GPS — parse and upsample to video frame rate.
-        println!("=== Step 4: 解析 GPS ===");
-        let (fps, duration) = ffprobe::probe_video_info(&front_file)?;
-        println!("{fps:.2} fps, {duration:.1}s");
-        let gps_smoothed = match gps::extract_smoothed_to_fps(&group.front_paths(), fps, duration) {
-            Ok((track, record_count)) => {
-                println!("{record_count} gnrmc records");
-                Some(track)
-            }
-            Err(e) => {
-                println!("GPS parsing failed: {e}");
-                None
-            }
-        };
-
         // Step 5: overlay
-        let overlay_file = if let Some(ref track) = gps_smoothed {
-            if interrupted.load(Ordering::SeqCst) {
-                println!("\nUser interrupted, stopping processing.");
-                return Ok(());
-            }
-            println!("=== Step 5: 生成 GPS 軌跡 overlay ===");
-            let overlay_size = if cli.big { 1920 } else { 480 };
-            match overlay::render_overlay_video(track, &cli.output, &group.name, fps, overlay_size)
-            {
-                Ok(path) => {
-                    println!("overlay -> {}", path.display());
-                    Some(path)
+        let overlay_file = if cli.gps {
+            println!("=== Step 4: 解析 GPS ===");
+            let (fps, duration) = ffprobe::probe_video_info(&front_file)?;
+            println!("{fps:.2} fps, {duration:.1}s");
+            let gps_smoothed = match gps::extract_smoothed_to_fps(&group.front_paths(), fps, duration) {
+                Ok((track, record_count)) => {
+                    println!("{record_count} gnrmc records");
+                    Some((track, fps))
                 }
                 Err(e) => {
-                    println!("overlay rendering failed: {e}");
+                    println!("GPS parsing failed: {e}");
                     None
                 }
+            };
+
+            if let Some((ref track, fps)) = gps_smoothed {
+                if interrupted.load(Ordering::SeqCst) {
+                    println!("\nUser interrupted, stopping processing.");
+                    return Ok(());
+                }
+                println!("=== Step 5: 生成 GPS 軌跡 overlay ===");
+                let overlay_size = if cli.big { 1920 } else { 480 };
+                match overlay::render_overlay_video(track, &cli.output, &group.name, fps, overlay_size)
+                {
+                    Ok(path) => {
+                        println!("overlay -> {}", path.display());
+                        Some(path)
+                    }
+                    Err(e) => {
+                        println!("overlay rendering failed: {e}");
+                        None
+                    }
+                }
+            } else {
+                println!("Step 5: (no GPS data, skipping overlay)");
+                None
             }
         } else {
-            println!("Step 5: (no GPS data, skipping overlay)");
+            println!("Step 4/5: (--gps not set, skipping GPS overlay)");
             None
         };
 
