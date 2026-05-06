@@ -141,14 +141,19 @@ fn extract_raw_entries(front_paths: &[&Path]) -> Result<Vec<RawGpsEntry>> {
         let entry_count = entries.len();
 
         let (_, duration) = probe_video_info(path)?;
-        let expected = duration.round() as usize;
-        if entry_count != expected {
+        // The firmware writes one GPS entry per complete second; the last
+        // partial second may or may not produce an entry, so accept both
+        // floor and ceil of the duration.
+        let floor_secs = duration.floor() as usize;
+        let ceil_secs = duration.ceil() as usize;
+        if entry_count != floor_secs && entry_count != ceil_secs {
             bail!(
-                "{}: gps box has {} entries but video duration is {:.3}s (expected {})",
+                "{}: gps box has {} entries but video duration is {:.3}s (expected {} or {})",
                 path.display(),
                 entry_count,
                 duration,
-                expected
+                floor_secs,
+                ceil_secs,
             );
         }
 
