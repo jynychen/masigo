@@ -121,7 +121,7 @@ pub fn scan_clip_groups(input_dir: &Path) -> Result<Vec<ClipGroup>> {
         if let Some(last) = current.last() {
             let gap = parse_datetime(&pair.front)
                 .and_then(|t| parse_datetime(&last.front).map(|p| (t - p).num_seconds()));
-            if gap.is_none_or(|s| s > gap_threshold) {
+            if gap.is_none_or(|s| s < 0 || s > gap_threshold) {
                 let name = format_group_name(&current);
                 groups.push(ClipGroup {
                     pairs: std::mem::take(&mut current),
